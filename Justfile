@@ -11,3 +11,6 @@ fmt:
 
 lint:
     cargo clippy -- -D warnings
+
+check-deps:
+    cargo machete --with-metadata

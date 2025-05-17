@@ -8,8 +8,11 @@ version = "0.1.0"
 
 [dependencies]
 anyhow = "1.0"
+clap = { version = "4.4", features = ["derive"] }
 crossterm = "0.27"
 dirs = "5.0"
+env_logger = "0.10"
+log = "0.4"
 ratatui = "0.26"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"

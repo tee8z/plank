@@ -10,6 +10,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{backend::CrosstermBackend, Terminal};
 
+mod cli;
 mod config;
 
 enum SidePanel {
@@ -19,11 +20,28 @@ enum SidePanel {
 
 struct AppState {
     side_panel: SidePanel,
+    // config: config::Config,  // Temporarily removed as it's not currently used
 }
 
 fn main() -> Result<()> {
-    // Load configuration
-    let config = config::Config::load();
+    // Parse CLI arguments and load configuration
+    let config = config::Config::load()?;
+
+    // Initialize logger
+    env_logger::Builder::from_default_env()
+        .filter_level(if config.debug {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Info
+        })
+        .init();
+
+    log::info!("Starting Plank Wallet");
+    log::debug!("Configuration: {:#?}", config);
+
+    // Create data directory if it doesn't exist
+    let data_dir = config::data_dir_path(&config);
+    log::debug!("Using data directory: {}", data_dir.display());
 
     // Setup terminal
     enable_raw_mode()?;
@@ -34,6 +52,7 @@ fn main() -> Result<()> {
 
     let mut app = AppState {
         side_panel: SidePanel::Receive,
+        // config: config,  // Temporarily removed as it's not currently used
     };
 
     loop {
@@ -198,7 +217,7 @@ fn main() -> Result<()> {
                 };
                 // Color code amount
                 let amount_val = tx.amount_sats.replace(",", "");
-                let amount_style = if amount_val.starts_with('+') {
+                let _amount_style = if amount_val.starts_with('+') {
                     ratatui::style::Style::default().fg(ratatui::style::Color::Green)
                 } else if amount_val.starts_with('-') {
                     ratatui::style::Style::default().fg(ratatui::style::Color::Red)
