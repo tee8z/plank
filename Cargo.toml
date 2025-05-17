@@ -1,12 +1,15 @@
 [package]
-authors = ["w3ird-tech"]
-description = "A lightweight, secure Bitcoin wallet for the Mutinynet signet network (TUI)."
-edition = "2021"
-license = "AGPL-3.0-or-later"
 name = "plank"
 version = "0.1.0"
+edition = "2021"
+description = "A lightweight, secure Bitcoin wallet for the Mutinynet signet network (TUI)."
+authors = ["w3ird-tech"]
+license = "AGPL-3.0-or-later"
 
 [dependencies]
-anyhow = "1.0"
-crossterm = "0.27"
 ratatui = "0.26"
+crossterm = "0.27"
+anyhow = "1.0"
+dirs = "5.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
