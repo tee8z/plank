@@ -4,14 +4,17 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use humantime::format_rfc3339_seconds;
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{backend::CrosstermBackend, Terminal};
+use wallet::AppWallet;
 
 mod cli;
 mod config;
+mod wallet;
 
 enum SidePanel {
     Receive,
@@ -23,7 +26,8 @@ struct AppState {
     // config: config::Config,  // Temporarily removed as it's not currently used
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     // Parse CLI arguments and load configuration
     let config = config::Config::load()?;
 
@@ -43,6 +47,8 @@ fn main() -> Result<()> {
     let data_dir = config::data_dir_path(&config);
     log::debug!("Using data directory: {}", data_dir.display());
 
+    let wallet = AppWallet::init(&data_dir, config.esplora_url, &config.name).await?;
+
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -56,6 +62,22 @@ fn main() -> Result<()> {
     };
 
     loop {
+        let sync_status = wallet.get_sync_status();
+        let syncing = if sync_status.is_syncing {
+            "Syncing"
+        } else {
+            "Synced"
+        };
+        let last_sync = sync_status.last_sync.map(|t| format_rfc3339_seconds(t));
+        let online_line = if last_sync.is_some() {
+            Line::from("Online: Yes")
+        } else {
+            Line::from(Span::styled(
+                "Warning: Offline mode!",
+                ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+            ))
+        };
+
         terminal.draw(|f| {
             let size = f.size();
             let main_block = Block::default()
@@ -87,17 +109,18 @@ fn main() -> Result<()> {
                 .title("Wallet Status")
                 .borders(Borders::ALL);
             let status_lines = vec![
-                Line::from("Wallet: plank-wallet (placeholder)"),
-                Line::from("Network: signet (placeholder)"),
-                Line::from("Balance: -- BTC"),
-                Line::from("Block Height: --"),
-                Line::from("Sync Status: Not synced (placeholder)"),
-                Line::from("Last Sync: never (placeholder)"),
-                Line::from("Online: --"),
-                Line::from(Span::styled(
-                    "Warning: Offline mode!",
-                    ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+                Line::from(format!("Wallet: {}", config.name)),
+                Line::from("Network: Mutinynet"),
+                Line::from(format!("Balance: {} sats", wallet.get_balance().to_sat())),
+                Line::from(format!("Block Height: {}", wallet.get_block_height())),
+                Line::from(format!("Sync Status: {}", syncing)),
+                Line::from(format!(
+                    "Last Sync: {}",
+                    last_sync
+                        .map(|t| t.to_string())
+                        .unwrap_or("Never".to_string())
                 )),
+                online_line,
             ];
             let status_content = Paragraph::new(status_lines).block(status_block);
             f.render_widget(status_content, top_layout[0]);
@@ -242,13 +265,15 @@ fn main() -> Result<()> {
             f.render_widget(tx_table, main_layout[1]);
         })?;
 
-        // Handle events
-        if let Event::Key(key) = event::read()? {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('r') => app.side_panel = SidePanel::Receive,
-                KeyCode::Char('s') => app.side_panel = SidePanel::Send,
-                _ => {}
+        // Handle events with a timeout to allow for periodic updates
+        if crossterm::event::poll(std::time::Duration::from_millis(100))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('r') => app.side_panel = SidePanel::Receive,
+                    KeyCode::Char('s') => app.side_panel = SidePanel::Send,
+                    _ => {}
+                }
             }
         }
     }

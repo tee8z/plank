@@ -15,6 +15,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Enable debug logging
     pub debug: bool,
+    /// Name of the wallet
+    pub name: String,
 }
 
 impl Default for Config {
@@ -27,6 +29,7 @@ impl Default for Config {
             offline: false,
             data_dir,
             debug: false,
+            name: "default".to_string(),
         }
     }
 }
@@ -48,6 +51,10 @@ impl Config {
 
         if let Some(data_dir) = cli.data_dir {
             config.data_dir = data_dir;
+        }
+
+        if let Some(name) = cli.name {
+            config.name = name;
         }
 
         Ok(config)
