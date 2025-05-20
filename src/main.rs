@@ -1,5 +1,5 @@
 use anyhow::Result;
-use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode};
+use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,7 +23,6 @@ enum SidePanel {
 
 struct AppState {
     side_panel: SidePanel,
-    // config: config::Config,  // Temporarily removed as it's not currently used
 }
 
 #[tokio::main]
@@ -52,13 +51,12 @@ async fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = AppState {
         side_panel: SidePanel::Receive,
-        // config: config,  // Temporarily removed as it's not currently used
     };
 
     loop {
@@ -181,45 +179,11 @@ async fn main() -> Result<()> {
                 .title("Recent Transactions")
                 .borders(Borders::ALL);
 
-            // Mock data
-            struct TxRow<'a> {
-                txid: &'a str,
-                memo: &'a str,
-                amount_sats: &'a str,
-                balance_sats: &'a str,
-            }
-            let tx_rows = vec![
-                TxRow {
-                    txid: "e3c1b3a7b2f0a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1",
-                    memo: "Salary",
-                    amount_sats: "+5000000",
-                    balance_sats: "15000000",
-                },
-                TxRow {
-                    txid: "b2d4c9e1f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1b2d4",
-                    memo: "Coffee at the very best cafe downtown",
-                    amount_sats: "-250000",
-                    balance_sats: "10000000",
-                },
-                TxRow {
-                    txid: "f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2",
-                    memo: "",
-                    amount_sats: "+10000000",
-                    balance_sats: "10250000",
-                },
-                TxRow {
-                    txid: "a7b2e3c1f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1f1a9d8c3e1d4b2c9e1a7b2e3c1",
-                    memo: "Rent",
-                    amount_sats: "-5000000",
-                    balance_sats: "250000",
-                },
-            ];
-
             let header = Row::new(vec![
                 Cell::from("TxID"),
                 Cell::from("Memo"),
-                Cell::from("Amount (sats)"),
-                Cell::from("Balance (sats)"),
+                Cell::from("Amount Sent (sats)"),
+                Cell::from("Amount Received (sats)"),
             ])
             .style(
                 ratatui::style::Style::default()
@@ -227,31 +191,32 @@ async fn main() -> Result<()> {
                     .add_modifier(Modifier::BOLD),
             );
 
-            let rows = tx_rows.iter().map(|tx| {
+            let transactions = wallet.get_transactions();
+            let rows = transactions.iter().map(|tx| {
                 // Truncate memo to 12 chars with ellipsis if needed
                 let memo_disp = if tx.memo.is_empty() {
                     "-".to_string()
-                } else if tx.memo.chars().count() > 12 {
-                    let mut short = tx.memo.chars().take(11).collect::<String>();
+                } else if tx.memo.chars().count() > 24 {
+                    let mut short = tx.memo.chars().take(23).collect::<String>();
                     short.push('…');
                     short
                 } else {
                     tx.memo.to_string()
                 };
+
                 // Color code amount
-                let amount_val = tx.amount_sats.replace(",", "");
-                let _amount_style = if amount_val.starts_with('+') {
-                    ratatui::style::Style::default().fg(ratatui::style::Color::Green)
-                } else if amount_val.starts_with('-') {
-                    ratatui::style::Style::default().fg(ratatui::style::Color::Red)
-                } else {
-                    ratatui::style::Style::default()
-                };
+                // let _amount_style = if amount_val.starts_with('+') {
+                //     ratatui::style::Style::default().fg(ratatui::style::Color::Green)
+                // } else if amount_val.starts_with('-') {
+                //     ratatui::style::Style::default().fg(ratatui::style::Color::Red)
+                // } else {
+                //     ratatui::style::Style::default()
+                // };
                 Row::new(vec![
-                    Cell::from(tx.txid),
+                    Cell::from(tx.id.to_string()),
                     Cell::from(memo_disp),
-                    Cell::from(tx.amount_sats),
-                    Cell::from(tx.balance_sats),
+                    Cell::from(tx.incoming_amount.display_dynamic().to_string()),
+                    Cell::from(tx.outgoing_amount.display_dynamic().to_string()),
                 ])
             });
 
@@ -280,6 +245,6 @@ async fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
-    execute!(std::io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
+    execute!(std::io::stdout(), LeaveAlternateScreen)?;
     Ok(())
 }

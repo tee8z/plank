@@ -6,10 +6,10 @@ use std::{path::Path, str::FromStr};
 use anyhow::{Context, Result};
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_wallet::bitcoin::bip32::Xpriv;
-use bdk_wallet::bitcoin::{Amount, Network};
+use bdk_wallet::bitcoin::{Amount, Network, TxIn, Txid};
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::template::Bip84;
-use bdk_wallet::{KeychainKind, PersistedWallet, Wallet};
+use bdk_wallet::{AddressInfo, KeychainKind, PersistedWallet, Wallet, WalletTx};
 use rand::Rng;
 use tokio::fs;
 
@@ -140,6 +140,50 @@ impl AppWallet {
         let sync_status = self.sync_status.read().unwrap();
         sync_status.clone()
     }
+    pub fn get_transactions(&self) -> Vec<Transaction> {
+        let wallet = self.wallet.read().unwrap();
+        wallet
+            .transactions()
+            .map(|tx| Transaction::from_wallet_transaction(&tx, &*wallet))
+            .collect()
+    }
+
+#[derive(Debug, Clone)]
+pub struct Transaction {
+    pub id: Txid,
+    pub memo: String,
+    pub incoming_amount: Amount,
+    pub outgoing_amount: Amount,
+}
+
+impl Transaction {
+    pub fn from_wallet_transaction(tx: &WalletTx, wallet: &PersistedWallet<Connection>) -> Self {
+        let tx = &tx.tx_node.tx;
+
+        let incoming_amount = tx
+            .output
+            .iter()
+            .filter(|output| wallet.is_mine(output.script_pubkey.clone()))
+            .map(|output| output.value)
+            .sum();
+        let outgoing_amount = tx
+            .input
+            .iter()
+            .filter(|input| wallet.is_mine(input.script_sig.clone()))
+            .map(|input| get_input_value(wallet, input))
+            .sum();
+
+        Self {
+            id: tx.compute_txid(),
+            memo: "".to_string(),
+            incoming_amount,
+            outgoing_amount,
+        }
+    }
+}
+
+fn get_input_value(wallet: &PersistedWallet<Connection>, input: &TxIn) -> Amount {
+    wallet.get_utxo(input.previous_output).unwrap().txout.value
 }
 
 async fn create_wallet(
