@@ -67,11 +67,6 @@ impl AppWallet {
             app_wallet_clone.update_block_height().await;
         });
 
-        let app_wallet_clone = app_wallet.clone();
-        tokio::spawn(async move {
-            app_wallet_clone.periodic_sync_wallet().await;
-        });
-
         Ok(app_wallet)
     }
 
@@ -83,17 +78,11 @@ impl AppWallet {
                 *block_height = new_block_height;
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
-        }
-    }
-
-    async fn periodic_sync_wallet(&self) {
-        loop {
             if let Err(e) = self.sync().await {
                 log::error!("Failed to sync wallet: {:#?}", e);
             }
 
-            tokio::time::sleep(tokio::time::Duration::from_secs(3 * 60)).await;
+            tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
         }
     }
 
@@ -140,6 +129,7 @@ impl AppWallet {
         let sync_status = self.sync_status.read().unwrap();
         sync_status.clone()
     }
+
     pub fn get_transactions(&self) -> Vec<Transaction> {
         let wallet = self.wallet.read().unwrap();
         wallet
