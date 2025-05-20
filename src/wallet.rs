@@ -138,6 +138,17 @@ impl AppWallet {
             .collect()
     }
 
+    pub fn new_address(&self) -> Result<AddressInfo> {
+        let mut wallet = self.wallet.write().unwrap();
+        let address = wallet.reveal_next_address(KeychainKind::External);
+
+        let mut conn = self.conn.lock().unwrap();
+        wallet.persist(&mut conn)?;
+
+        Ok(address)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Transaction {
     pub id: Txid,

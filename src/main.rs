@@ -59,6 +59,8 @@ async fn main() -> Result<()> {
         side_panel: SidePanel::Receive,
     };
 
+    let mut address = wallet.new_address()?;
+
     loop {
         let sync_status = wallet.get_sync_status();
         let syncing = if sync_status.is_syncing {
@@ -133,7 +135,7 @@ async fn main() -> Result<()> {
                         Line::from("[ Receive Funds ]"),
                         Line::from(""),
                         Line::from("Address:"),
-                        Line::from("  bc1qxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx (placeholder)"),
+                        Line::from(format!("  {}", address.address)),
                         Line::from(""),
                         Line::from("[QR CODE PLACEHOLDER]"),
                         Line::from(""),
@@ -235,7 +237,10 @@ async fn main() -> Result<()> {
             if let Event::Key(key) = event::read()? {
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('r') => app.side_panel = SidePanel::Receive,
+                    KeyCode::Char('r') => {
+                        app.side_panel = SidePanel::Receive;
+                        address = wallet.new_address()?;
+                    }
                     KeyCode::Char('s') => app.side_panel = SidePanel::Send,
                     _ => {}
                 }
