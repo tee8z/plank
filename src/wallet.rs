@@ -5,10 +5,11 @@ use std::{path::Path, str::FromStr};
 
 use anyhow::{Context, Result};
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
-use bdk_wallet::bitcoin::bip32::Xpriv;
+use bdk_wallet::bitcoin::bip32::{Xpriv, Xpub};
 use bdk_wallet::bitcoin::{Amount, Network, TxIn, Txid};
+use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::rusqlite::Connection;
-use bdk_wallet::template::Bip84;
+use bdk_wallet::template::{Bip84, Bip84Public};
 use bdk_wallet::{AddressInfo, KeychainKind, PersistedWallet, Wallet, WalletTx};
 use rand::Rng;
 use tokio::fs;
@@ -32,13 +33,16 @@ impl AppWallet {
     pub async fn init(data_dir: &Path, esplora_url: String, name: &str) -> Result<Self> {
         let db_filename = format!("{}.db", name);
         let db_path = data_dir.join(db_filename);
-        let key_filename = format!("{}.pvt", name);
+        let key_filename = format!("{}.key", name);
         let key_path = data_dir.join(key_filename);
 
         let mut conn = tokio::task::spawn_blocking(move || Connection::open(db_path)).await??;
 
         let (mut wallet, created) = match fs::read_to_string(&key_path).await {
-            Ok(contents) => (load_wallet(&mut conn, &contents)?, false),
+            Ok(contents) if contents.starts_with("xprv") => {
+                (load_wallet_with_pvt(&mut conn, &contents)?, false)
+            }
+            Ok(contents) => (load_wallet_with_pub(&mut conn, &contents)?, false),
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 (create_wallet(&mut conn, &key_path).await?, true)
             }
@@ -197,32 +201,83 @@ async fn create_wallet(
     let xpriv = Xpriv::new_master(Network::Signet, &data)?;
     fs::write(key_path, xpriv.to_string()).await?;
 
-    let wallet = Wallet::create(
+    init_new_wallet(
+        conn,
         Bip84(xpriv, KeychainKind::External),
         Bip84(xpriv, KeychainKind::Internal),
     )
-    .network(Network::Signet)
-    .create_wallet(conn)?;
+}
+
+fn load_wallet_with_pvt(
+    conn: &mut Connection,
+    key_contents: &str,
+) -> Result<PersistedWallet<Connection>> {
+    let key = Xpriv::from_str(key_contents)?;
+    let d1 = Bip84(key, KeychainKind::External);
+    let d2 = Bip84(key, KeychainKind::Internal);
+
+    if let Some(wallet) = load_wallet(conn, d1.clone(), d2.clone(), true)? {
+        Ok(wallet)
+    } else {
+        // no changeset. file was created and then tui booted up. consider it an import of a key.
+        // so we need to create a new wallet
+        init_new_wallet(conn, d1, d2)
+    }
+}
+
+fn load_wallet_with_pub(
+    conn: &mut Connection,
+    key_contents: &str,
+) -> Result<PersistedWallet<Connection>> {
+    let key = Xpub::from_str(key_contents)?;
+    let fingerprint = key.fingerprint();
+    let d1 = Bip84Public(key, fingerprint, KeychainKind::External);
+    let d2 = Bip84Public(key, fingerprint, KeychainKind::Internal);
+
+    if let Some(wallet) = load_wallet(conn, d1.clone(), d2.clone(), false)? {
+        Ok(wallet)
+    } else {
+        // no changeset. file was created and then tui booted up. consider it an import of a key.
+        // so we need to create a new wallet
+        init_new_wallet(conn, d1, d2)
+    }
+}
+
+fn init_new_wallet<D>(
+    conn: &mut Connection,
+    descriptor_1: D,
+    descriptor_2: D,
+) -> Result<PersistedWallet<Connection>>
+where
+    D: IntoWalletDescriptor + Send + Clone + 'static,
+{
+    let wallet = Wallet::create(descriptor_1, descriptor_2)
+        .network(Network::Signet)
+        .create_wallet(conn)?;
 
     Ok(wallet)
 }
 
-fn load_wallet(conn: &mut Connection, key_contents: &str) -> Result<PersistedWallet<Connection>> {
-    let key = Xpriv::from_str(key_contents)?;
+fn load_wallet<D, E>(
+    conn: &mut Connection,
+    descriptor_1: D,
+    descriptor_2: E,
+    is_pvt: bool,
+) -> Result<Option<PersistedWallet<Connection>>>
+where
+    D: IntoWalletDescriptor + Send + 'static,
+    E: IntoWalletDescriptor + Send + 'static,
+{
+    let mut wallet = bdk_wallet::Wallet::load()
+        .descriptor(KeychainKind::External, Some(descriptor_1))
+        .descriptor(KeychainKind::Internal, Some(descriptor_2))
+        .check_network(Network::Signet);
 
-    let wallet = bdk_wallet::Wallet::load()
-        .descriptor(
-            KeychainKind::External,
-            Some(Bip84(key, KeychainKind::External)),
-        )
-        .descriptor(
-            KeychainKind::Internal,
-            Some(Bip84(key, KeychainKind::Internal)),
-        )
-        .extract_keys()
-        .check_network(Network::Signet)
-        .load_wallet(conn)?
-        .unwrap();
+    if is_pvt {
+        wallet = wallet.extract_keys();
+    }
+
+    let wallet = wallet.load_wallet(conn)?;
 
     Ok(wallet)
 }
