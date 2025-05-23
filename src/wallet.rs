@@ -39,7 +39,7 @@ impl AppWallet {
         let mut conn = tokio::task::spawn_blocking(move || Connection::open(db_path)).await??;
 
         let (mut wallet, created) = match fs::read_to_string(&key_path).await {
-            Ok(contents) if contents.starts_with("xprv") => {
+            Ok(contents) if contents.starts_with("tprv") => {
                 (load_wallet_with_pvt(&mut conn, &contents)?, false)
             }
             Ok(contents) => (load_wallet_with_pub(&mut conn, &contents)?, false),
