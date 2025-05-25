@@ -9,6 +9,9 @@ use ratatui::{
     Frame, Terminal,
 };
 
+use crate::config::Config;
+use crate::wallet::AppWallet;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Send,
@@ -42,27 +45,19 @@ impl Tab {
 
 pub struct App {
     pub should_quit: bool,
-    wallet_name: String,
-    balance: u64,
-    pending_balance: u64,
     current_tab: Tab,
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self {
-            should_quit: false,
-            wallet_name: "My Wallet".to_string(),
-            balance: 0,
-            pending_balance: 0,
-            current_tab: Tab::default(),
-        }
-    }
+    wallet: AppWallet,
+    config: Config,
 }
 
 impl App {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(wallet: AppWallet, config: Config) -> Self {
+        Self {
+            should_quit: false,
+            current_tab: Tab::default(),
+            wallet,
+            config,
+        }
     }
 
     pub fn run(&mut self) -> Result<()> {
@@ -117,7 +112,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
-                Constraint::Length(4), // 4 lines of text
+                Constraint::Length(3), // 4 lines of text
                 Constraint::Min(1),
             ])
             .split(area);
@@ -129,23 +124,25 @@ impl App {
         ])
         .split(chunks[1])[1]; // Take the middle chunk
 
-        // Wallet title
-        let title_text = Line::from(Span::styled("Wallet", Style::default().bold()));
-
         // Wallet name
-        let name_text = format!("Name: {}", self.wallet_name);
-        let name_text = Line::from(Span::styled(name_text, Style::default()));
+        let name_text = Line::from(vec![
+            Span::from("Name: "),
+            Span::styled(&self.config.name, Style::default().bold()),
+        ]);
 
         // Balance
-        let balance_text = format!("Balance: {} sats", self.balance);
-        let balance_text = Line::from(Span::styled(balance_text, Style::default()));
+        let balance_text = format!("Balance: {}", self.wallet.get_balance().display_dynamic());
+        let balance_text = Line::from(Span::styled(balance_text, Style::default().green()));
 
         // Pending
-        let pending_text = format!("Pending: {} sats", self.pending_balance);
-        let pending_text = Line::from(Span::styled(pending_text, Style::default()));
+        let pending_text = format!(
+            "Pending: {}",
+            self.wallet.get_pending_balance().display_dynamic()
+        );
+        let pending_text = Line::from(Span::styled(pending_text, Style::default().yellow()));
 
         // Create a single paragraph with all lines
-        let text = Text::from(vec![title_text, name_text, balance_text, pending_text]);
+        let text = Text::from(vec![name_text, balance_text, pending_text]);
         let info = Paragraph::new(text).centered();
         f.render_widget(info, container);
     }

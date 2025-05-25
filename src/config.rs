@@ -5,6 +5,8 @@ use anyhow::{Context, Result};
 use dirs::config_dir;
 use serde::{Deserialize, Serialize};
 
+use crate::cli::Cli;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Config {
     /// URL of the Esplora server
@@ -37,7 +39,7 @@ impl Default for Config {
 impl Config {
     /// Load configuration from file and merge with CLI arguments
     pub fn load() -> Result<Self> {
-        let cli = crate::cli::Cli::parse();
+        let cli = Cli::parse();
         let mut config = Self::load_from_file(&cli)?;
 
         // Apply CLI overrides
@@ -61,7 +63,7 @@ impl Config {
     }
 
     /// Load configuration from file if it exists, otherwise return default
-    fn load_from_file(cli: &crate::cli::Cli) -> Result<Self> {
+    fn load_from_file(cli: &Cli) -> Result<Self> {
         let path = match &cli.config {
             Some(path) => path.clone(),
             None => config_path()?,

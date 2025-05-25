@@ -30,7 +30,7 @@ pub struct AppWallet {
 }
 
 impl AppWallet {
-    pub async fn init(data_dir: &Path, esplora_url: String, name: &str) -> Result<Self> {
+    pub async fn init(data_dir: &Path, esplora_url: &str, name: &str) -> Result<Self> {
         let db_filename = format!("{}.db", name);
         let db_path = data_dir.join(db_filename);
         let key_filename = format!("{}.key", name);
@@ -122,6 +122,12 @@ impl AppWallet {
     pub fn get_balance(&self) -> Amount {
         let wallet = self.wallet.read().unwrap();
         wallet.balance().total()
+    }
+
+    pub fn get_pending_balance(&self) -> Amount {
+        let wallet = self.wallet.read().unwrap();
+        let balance = wallet.balance();
+        balance.trusted_pending + balance.untrusted_pending
     }
 
     pub fn get_block_height(&self) -> u32 {
