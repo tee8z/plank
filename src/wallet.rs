@@ -143,7 +143,8 @@ impl AppWallet {
     pub fn get_transactions(&self) -> Vec<Transaction> {
         let wallet = self.wallet.read().unwrap();
         wallet
-            .transactions()
+            .transactions_sort_by(|tx1, tx2| tx2.chain_position.cmp(&tx1.chain_position))
+            .iter()
             .map(|tx| Transaction::from_wallet_transaction(&tx, &*wallet))
             .collect()
     }

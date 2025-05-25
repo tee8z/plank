@@ -1,4 +1,7 @@
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
+use arboard::Clipboard;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     backend::CrosstermBackend,
@@ -12,12 +15,77 @@ use ratatui::{
 use crate::config::Config;
 use crate::wallet::AppWallet;
 
-use std::time::{Duration, Instant};
+#[derive(Debug, Clone)]
+pub enum ToastLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+impl Default for ToastLevel {
+    fn default() -> Self {
+        Self::Info
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub message: String,
+    pub level: ToastLevel,
+    pub timestamp: Instant,
+    pub duration: Duration,
+}
+
+impl Toast {
+    pub fn new(message: impl Into<String>, level: ToastLevel) -> Self {
+        Self {
+            message: message.into(),
+            level,
+            timestamp: Instant::now(),
+            duration: Duration::from_secs(3),
+        }
+    }
+
+    pub fn info(message: impl Into<String>) -> Self {
+        Self::new(message, ToastLevel::Info)
+    }
+
+    pub fn success(message: impl Into<String>) -> Self {
+        Self::new(message, ToastLevel::Success)
+    }
+
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self::new(message, ToastLevel::Warning)
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::new(message, ToastLevel::Error)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.timestamp.elapsed() > self.duration
+    }
+}
+
+impl<'a> From<&'a Toast> for Span<'a> {
+    fn from(toast: &'a Toast) -> Self {
+        let (icon, style) = match toast.level {
+            ToastLevel::Info => ("i", Style::default().fg(ratatui::style::Color::LightBlue)),
+            ToastLevel::Success => ("✓", Style::default().fg(ratatui::style::Color::Green)),
+            ToastLevel::Warning => ("!", Style::default().fg(ratatui::style::Color::Yellow)),
+            ToastLevel::Error => ("✗", Style::default().fg(ratatui::style::Color::Red)),
+        };
+
+        Span::styled(format!("{} {}", icon, toast.message), style)
+    }
+}
 
 pub struct App {
     pub should_quit: bool,
     wallet: AppWallet,
     config: Config,
+    toast: Option<Toast>,
 }
 
 impl App {
@@ -26,6 +94,7 @@ impl App {
             should_quit: false,
             wallet,
             config,
+            toast: None,
         }
     }
 
@@ -43,7 +112,7 @@ impl App {
         Ok(())
     }
 
-    fn draw(&self, f: &mut Frame) {
+    fn draw(&mut self, f: &mut Frame) {
         let size = f.size();
 
         // Main container with border around the entire application
@@ -63,9 +132,30 @@ impl App {
         // Draw the main block
         f.render_widget(main_block, size);
 
+        // Draw toast notification if it exists and not expired
+        if let Some(toast) = &self.toast {
+            if !toast.is_expired() {
+                let notification = Paragraph::new(Line::from(vec![Span::from(toast)])).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .style(Style::default().bg(ratatui::style::Color::DarkGray)),
+                );
+
+                let area = Rect {
+                    x: size.width / 4,
+                    y: size.height - 3,
+                    width: size.width / 2,
+                    height: 3,
+                };
+                f.render_widget(notification, area);
+            } else {
+                // Clear expired toast
+                self.toast = None;
+            }
+        }
+
         // Draw the left side (wallet info)
         self.draw_wallet_info(f, left);
-
         // Draw the right side
         self.draw_transactions(f, right);
     }
@@ -113,17 +203,10 @@ impl App {
 
     fn draw_transactions(&self, f: &mut Frame, area: Rect) {
         // Draw the transactions section
-        let transactions_area = Layout::vertical([
-            Constraint::Length(1), // Title
-            Constraint::Min(1),    // Transactions list
+        let [tx_table] = Layout::vertical([
+            Constraint::Min(1), // Transactions list
         ])
-        .split(area);
-
-        let transactions_title = Paragraph::new(Span::styled(
-            "Transactions",
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-        f.render_widget(transactions_title, transactions_area[0]);
+        .areas(area);
 
         // Create table rows
         let rows: Vec<Row> = self
@@ -158,35 +241,61 @@ impl App {
         .block(Block::default())
         .column_spacing(1);
 
-        f.render_widget(table, transactions_area[1]);
+        f.render_widget(table, tx_table);
     }
 
-    fn handle_events(&mut self) -> Result<()> {
-        if event::poll(std::time::Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => {
-                        self.should_quit = true;
-                    }
-                    KeyCode::Char('h') | KeyCode::Left => {
-                        self.current_tab = self.current_tab.previous();
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => {
-                        self.current_tab = self.current_tab.next();
-                    }
-                    KeyCode::Char('1') => {
-                        self.current_tab = Tab::Send;
-                    }
-                    KeyCode::Char('2') => {
-                        self.current_tab = Tab::Receive;
-                    }
-                    KeyCode::Char('3') => {
-                        self.current_tab = Tab::Transactions;
-                    }
-                    _ => {}
+    /// Show a toast notification
+    pub fn show_toast(&mut self, toast: Toast) {
+        self.toast = Some(toast);
+    }
+
+    /// Handle clipboard operations for new addresses
+    fn handle_new_address(&mut self) {
+        let address_info = match self.wallet.new_address() {
+            Ok(info) => info,
+            Err(e) => {
+                self.show_toast(Toast::error(format!("Failed to generate address: {}", e)));
+                return;
+            }
+        };
+
+        let address = address_info.address.to_string();
+        match Clipboard::new() {
+            Ok(mut clipboard) => {
+                if let Err(e) = clipboard.set_text(address.clone()) {
+                    self.show_toast(Toast::error(format!("Failed to copy to clipboard: {}", e)));
+                } else {
+                    self.show_toast(Toast::success(format!(
+                        "Address copied to clipboard: {}",
+                        address
+                    )));
                 }
             }
+            Err(e) => {
+                self.show_toast(Toast::error(format!("Failed to access clipboard: {}", e)));
+            }
         }
+    }
+
+    /// Handle key press events
+    fn handle_key_event(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('r') => self.handle_new_address(),
+            _ => {}
+        }
+    }
+
+    /// Handle all input events
+    fn handle_events(&mut self) -> Result<()> {
+        if !event::poll(std::time::Duration::from_millis(100))? {
+            return Ok(());
+        }
+
+        if let Event::Key(key) = event::read()? {
+            self.handle_key_event(key.code);
+        }
+
         Ok(())
     }
 }
