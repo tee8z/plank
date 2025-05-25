@@ -6,7 +6,7 @@ use std::{path::Path, str::FromStr};
 use anyhow::{Context, Result};
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_wallet::bitcoin::bip32::{Xpriv, Xpub};
-use bdk_wallet::bitcoin::{Amount, Network, TxIn, Txid};
+use bdk_wallet::bitcoin::{self, Amount, Network, TxIn};
 use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::template::{Bip84, Bip84Public};
@@ -160,6 +160,30 @@ impl AppWallet {
 }
 
 #[derive(Debug, Clone)]
+pub struct Txid(bitcoin::Txid);
+
+impl std::ops::Deref for Txid {
+    type Target = bitcoin::Txid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for Txid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.0.to_string();
+        if s.len() <= 20 {
+            // If the string is short, just display it as is
+            write!(f, "{}", s)
+        } else {
+            // Otherwise, show first 10 and last 10 characters with ... in between
+            write!(f, "{}...{}", &s[..10], &s[s.len() - 10..])
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Transaction {
     pub id: Txid,
     pub memo: String,
@@ -185,7 +209,7 @@ impl Transaction {
             .sum();
 
         Self {
-            id: tx.compute_txid(),
+            id: Txid(tx.compute_txid()),
             memo: "".to_string(),
             incoming_amount,
             outgoing_amount,

@@ -3,49 +3,19 @@ use crossterm::event::{self, Event, KeyCode};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
+    style::{Modifier, Style, Stylize},
     text::{Line, Span, Text},
-    widgets::{block::Block, Borders, Paragraph, Tabs},
+    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
     Frame, Terminal,
 };
 
 use crate::config::Config;
 use crate::wallet::AppWallet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tab {
-    Send,
-    Receive,
-    Transactions,
-}
-
-impl Default for Tab {
-    fn default() -> Self {
-        Self::Send
-    }
-}
-
-impl Tab {
-    pub fn next(self) -> Self {
-        match self {
-            Tab::Send => Tab::Receive,
-            Tab::Receive => Tab::Transactions,
-            Tab::Transactions => Tab::Send,
-        }
-    }
-
-    pub fn previous(self) -> Self {
-        match self {
-            Tab::Send => Tab::Transactions,
-            Tab::Receive => Tab::Send,
-            Tab::Transactions => Tab::Receive,
-        }
-    }
-}
+use std::time::{Duration, Instant};
 
 pub struct App {
     pub should_quit: bool,
-    current_tab: Tab,
     wallet: AppWallet,
     config: Config,
 }
@@ -54,7 +24,6 @@ impl App {
     pub fn new(wallet: AppWallet, config: Config) -> Self {
         Self {
             should_quit: false,
-            current_tab: Tab::default(),
             wallet,
             config,
         }
@@ -82,9 +51,9 @@ impl App {
             .borders(Borders::ALL)
             .title("Plank - Mutinynet Wallet");
 
-        // Split the inner area into left (wallet info) and right (tabs) sections with a line in between
+        // Split the inner area into left (wallet info) and right (transactions) sections with a line in between
         let inner_area = main_block.inner(size);
-        let [left, center, right] = Layout::horizontal([
+        let [left, _center, right] = Layout::horizontal([
             Constraint::Percentage(49),
             Constraint::Length(1), // For the vertical line
             Constraint::Percentage(50),
@@ -97,13 +66,8 @@ impl App {
         // Draw the left side (wallet info)
         self.draw_wallet_info(f, left);
 
-        // Draw the vertical line with a style to make it more visible
-        let vertical_line = Paragraph::new("│".repeat(center.height as usize))
-            .style(Style::default().fg(Color::Gray));
-        f.render_widget(vertical_line, center);
-
-        // Draw the right side (tabs)
-        self.draw_tabs(f, right);
+        // Draw the right side
+        self.draw_transactions(f, right);
     }
 
     fn draw_wallet_info(&self, f: &mut Frame, area: Rect) {
@@ -147,38 +111,54 @@ impl App {
         f.render_widget(info, container);
     }
 
-    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
-        // Create a centered layout for the tabs
-        let tab_area = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1), // Title
-                Constraint::Length(3), // Tabs
-            ])
-            .split(area);
+    fn draw_transactions(&self, f: &mut Frame, area: Rect) {
+        // Draw the transactions section
+        let transactions_area = Layout::vertical([
+            Constraint::Length(1), // Title
+            Constraint::Min(1),    // Transactions list
+        ])
+        .split(area);
 
-        // Actions title
-        let title = Paragraph::new(Span::styled(
-            "Actions",
+        let transactions_title = Paragraph::new(Span::styled(
+            "Transactions",
             Style::default().add_modifier(Modifier::BOLD),
         ));
-        f.render_widget(title, tab_area[0]);
+        f.render_widget(transactions_title, transactions_area[0]);
 
-        // Tabs without border
-        let tabs = Tabs::new(vec![
-            Span::styled(" Send ", Style::default().fg(Color::Yellow)),
-            Span::styled(" Receive ", Style::default().fg(Color::Yellow)),
-            Span::styled(" Transactions ", Style::default().fg(Color::Yellow)),
-        ])
-        .select(match self.current_tab {
-            Tab::Send => 0,
-            Tab::Receive => 1,
-            Tab::Transactions => 2,
-        })
-        .highlight_style(Style::default().add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
-        .divider(" | ");
+        // Create table rows
+        let rows: Vec<Row> = self
+            .wallet
+            .get_transactions()
+            .iter()
+            .map(|tx| {
+                Row::new(vec![
+                    Cell::from(tx.id.to_string()),
+                    Cell::from(tx.memo.clone()),
+                    Cell::from(tx.incoming_amount.display_dynamic().to_string()),
+                    Cell::from(tx.outgoing_amount.display_dynamic().to_string()),
+                ])
+            })
+            .collect();
 
-        f.render_widget(tabs, tab_area[1]);
+        // Create the table
+        let table = Table::new(
+            rows,
+            &[
+                Constraint::Length(25),
+                Constraint::Min(15),
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
+            ],
+        )
+        .header(
+            Row::new(vec!["ID", "Memo", "Incoming", "Outgoing"])
+                .style(Style::default().add_modifier(Modifier::BOLD))
+                .bottom_margin(1),
+        )
+        .block(Block::default())
+        .column_spacing(1);
+
+        f.render_widget(table, transactions_area[1]);
     }
 
     fn handle_events(&mut self) -> Result<()> {
