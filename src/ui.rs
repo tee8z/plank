@@ -2,15 +2,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
+use crossterm::event::KeyEvent;
 use crossterm::event::{self, Event, KeyCode};
+use ratatui::text::Text;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style, Stylize},
-    text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
+    style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Cell, Clear, Paragraph, Row, Table},
     Frame, Terminal,
 };
+use tui_textarea::TextArea;
 
 use crate::config::Config;
 use crate::wallet::AppWallet;
@@ -81,11 +84,201 @@ impl<'a> From<&'a Toast> for Span<'a> {
     }
 }
 
+pub struct SendModal {
+    address_input: TextArea<'static>,
+    amount_input: TextArea<'static>,
+    active_input: usize, // 0 for address, 1 for amount
+    show_modal: bool,
+}
+
+impl Default for SendModal {
+    fn default() -> Self {
+        let mut address_input = TextArea::default();
+        let mut amount_input = TextArea::default();
+
+        // Configure address input
+        address_input.set_placeholder_text("Enter recipient address");
+        address_input.set_cursor_line_style(Style::default());
+
+        // Configure amount input
+        amount_input.set_placeholder_text("Enter amount in BTC");
+        amount_input.set_cursor_line_style(Style::default());
+
+        Self {
+            address_input,
+            amount_input,
+            active_input: 0,
+            show_modal: false,
+        }
+    }
+}
+
+impl SendModal {
+    fn toggle(&mut self) {
+        self.show_modal = !self.show_modal;
+        if self.show_modal {
+            self.active_input = 0;
+            let mut address_input = TextArea::default();
+            let mut amount_input = TextArea::default();
+
+            // Configure address input
+            address_input.set_placeholder_text("Enter recipient address");
+            address_input.set_cursor_line_style(Style::default());
+
+            // Configure amount input
+            amount_input.set_placeholder_text("Enter amount in BTC");
+            amount_input.set_cursor_line_style(Style::default());
+
+            self.address_input = address_input;
+            self.amount_input = amount_input;
+
+            set_input_styles(&mut self.address_input, self.active_input == 0);
+            set_input_styles(&mut self.amount_input, self.active_input == 1);
+        }
+    }
+
+    fn handle_input(&mut self, input: KeyEvent) -> bool {
+        match input.code {
+            KeyCode::Tab => {
+                self.active_input = (self.active_input + 1) % 2;
+                set_input_styles(&mut self.address_input, self.active_input == 0);
+                set_input_styles(&mut self.amount_input, self.active_input == 1);
+                true
+            }
+            KeyCode::Esc => {
+                self.show_modal = false;
+                false
+            }
+            _ => {
+                let current_input = match self.active_input {
+                    0 => &mut self.address_input,
+                    1 => &mut self.amount_input,
+                    _ => return false,
+                };
+                current_input.input(input);
+                true
+            }
+        }
+    }
+
+    /// Render the send bitcoin modal dialog
+    fn render_modal(&mut self, f: &mut Frame, area: Rect) {
+        // Clear the area
+        let block = Block::default()
+            .title(" Send Bitcoin ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::LightBlue));
+
+        f.render_widget(Clear, area);
+        f.render_widget(block, area);
+
+        // Inner area with padding
+        let inner = area.inner(&Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
+
+        // Layout for the form
+        let chunks = Layout::vertical([
+            Constraint::Length(1),  // Address label
+            Constraint::Length(10), // Address input
+            Constraint::Length(1),  // Spacer
+            Constraint::Length(1),  // Amount label
+            Constraint::Length(10), // Amount input
+            Constraint::Min(1),     // Spacer
+            Constraint::Length(3),  // Buttons
+        ])
+        .split(inner);
+
+        // Render address label
+        let address_label = Paragraph::new("Recipient Address:")
+            .style(Style::default().add_modifier(Modifier::BOLD));
+        f.render_widget(address_label, chunks[0]);
+
+        // Configure and render address input
+        let address_input = self.address_input.clone();
+        f.render_widget(address_input.widget(), chunks[1]);
+
+        // Render amount label
+        let amount_label =
+            Paragraph::new("Amount (sats):").style(Style::default().add_modifier(Modifier::BOLD));
+        f.render_widget(amount_label, chunks[3]);
+
+        // Configure and render amount input
+        let amount_input = self.amount_input.clone();
+        f.render_widget(amount_input.widget(), chunks[4]);
+
+        // Render buttons
+        let button_area =
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+                .split(chunks[6]);
+
+        // Cancel button
+        let cancel_button = Paragraph::new("Cancel (Esc)")
+            .centered()
+            .style(Style::default().fg(Color::Gray));
+
+        // Send button
+        let send_button = Paragraph::new("Send (Enter)")
+            .centered()
+            .style(Style::default().fg(Color::Gray));
+
+        f.render_widget(cancel_button, button_area[0]);
+        f.render_widget(send_button, button_area[1]);
+
+        // Set cursor position for active input
+        if self.active_input == 0 {
+            let (_, col) = self.address_input.cursor();
+            f.set_cursor(chunks[1].x + col as u16, chunks[1].y);
+        } else {
+            let (_, col) = self.amount_input.cursor();
+            f.set_cursor(chunks[4].x + col as u16, chunks[4].y);
+        }
+    }
+
+    fn render(&mut self, f: &mut Frame) {
+        if !self.show_modal {
+            return;
+        }
+
+        // Create a centered area for the modal
+        let area = centered_rect(60, 20, f.size());
+        self.render_modal(f, area);
+    }
+}
+
+fn set_input_styles(input: &mut TextArea<'_>, active: bool) {
+    if active {
+        input.set_cursor_style(Style::default().add_modifier(Modifier::REVERSED));
+    } else {
+        input.set_cursor_style(Style::default());
+    }
+}
+
+/// Helper function to center a rectangle with given width and height
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::vertical([
+        Constraint::Percentage((100 - percent_y) / 2),
+        Constraint::Percentage(percent_y),
+        Constraint::Percentage((100 - percent_y) / 2),
+    ])
+    .split(r);
+
+    Layout::horizontal([
+        Constraint::Percentage((100 - percent_x) / 2),
+        Constraint::Percentage(percent_x),
+        Constraint::Percentage((100 - percent_x) / 2),
+    ])
+    .split(popup_layout[1])[1]
+}
+
 pub struct App {
     pub should_quit: bool,
     wallet: AppWallet,
     config: Config,
     toast: Option<Toast>,
+    send_modal: SendModal,
 }
 
 impl App {
@@ -95,6 +288,7 @@ impl App {
             wallet,
             config,
             toast: None,
+            send_modal: SendModal::default(),
         }
     }
 
@@ -115,13 +309,41 @@ impl App {
     fn draw(&mut self, f: &mut Frame) {
         let size = f.size();
 
-        // Main container with border around the entire application
+        // Split the main area into content and help bar
+        let [content_area, help_area] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(size);
+
+        // Main container with border around the content area
         let main_block = Block::default()
             .borders(Borders::ALL)
             .title("Plank - Mutinynet Wallet");
 
+        // Help bar at the bottom
+        let help_text = Line::from(vec![
+            Span::styled("q:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Quit  "),
+            Span::styled("r:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Receive  "),
+            Span::styled("s:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Send  "),
+            Span::styled("Esc:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(" Cancel"),
+        ]);
+
+        let help_bar = Paragraph::new(help_text)
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Center);
+
+        // Draw the send modal if it's visible
+        self.send_modal.render(f);
+
+        // Don't draw the rest of the UI if the modal is showing
+        if self.send_modal.show_modal {
+            return;
+        }
+
         // Split the inner area into left (wallet info) and right (transactions) sections with a line in between
-        let inner_area = main_block.inner(size);
+        let inner_area = main_block.inner(content_area);
         let [left, _center, right] = Layout::horizontal([
             Constraint::Percentage(49),
             Constraint::Length(1), // For the vertical line
@@ -129,8 +351,9 @@ impl App {
         ])
         .areas(inner_area);
 
-        // Draw the main block
-        f.render_widget(main_block, size);
+        // Draw the main content and help bar
+        f.render_widget(main_block, content_area);
+        f.render_widget(help_bar, help_area);
 
         // Draw toast notification if it exists and not expired
         if let Some(toast) = &self.toast {
@@ -143,7 +366,7 @@ impl App {
 
                 let area = Rect {
                     x: size.width / 4,
-                    y: size.height - 3,
+                    y: content_area.y + content_area.height - 3,
                     width: size.width / 2,
                     height: 3,
                 };
@@ -166,7 +389,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
-                Constraint::Length(3), // 4 lines of text
+                Constraint::Length(3), // 3 lines of text
                 Constraint::Min(1),
             ])
             .split(area);
@@ -198,6 +421,7 @@ impl App {
         // Create a single paragraph with all lines
         let text = Text::from(vec![name_text, balance_text, pending_text]);
         let info = Paragraph::new(text).centered();
+
         f.render_widget(info, container);
     }
 
@@ -278,12 +502,21 @@ impl App {
     }
 
     /// Handle key press events
-    fn handle_key_event(&mut self, key: KeyCode) {
-        match key {
+    fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+        if self.send_modal.show_modal {
+            return self.send_modal.handle_input(key);
+        }
+
+        match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('r') => self.handle_new_address(),
+            KeyCode::Char('s') => {
+                self.send_modal.toggle();
+                return false; // Event handled, stop further processing
+            }
             _ => {}
         }
+        true
     }
 
     /// Handle all input events
@@ -293,7 +526,10 @@ impl App {
         }
 
         if let Event::Key(key) = event::read()? {
-            self.handle_key_event(key.code);
+            let event_handled = self.handle_key_event(key);
+            if event_handled {
+                return Ok(());
+            }
         }
 
         Ok(())
