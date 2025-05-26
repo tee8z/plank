@@ -1,7 +1,9 @@
+use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
+use bdk_wallet::bitcoin::{Address, Network};
 use crossterm::event::KeyEvent;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::text::Text;
@@ -84,10 +86,22 @@ impl<'a> From<&'a Toast> for Span<'a> {
     }
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+enum ModalErr {
+    #[error("No address provided")]
+    EmptyAddress,
+    #[error("No amount provided")]
+    EmptyAmount,
+    #[error("Invalid address: {0}")]
+    InvalidAddress(String),
+    #[error("Invalid amount: {0}")]
+    InvalidAmount(String),
+}
+
 pub struct SendModal {
     address_input: TextArea<'static>,
     amount_input: TextArea<'static>,
-    active_input: usize, // 0 for address, 1 for amount
+    active_input: usize,
     show_modal: bool,
 }
 
@@ -131,9 +145,6 @@ impl SendModal {
 
             self.address_input = address_input;
             self.amount_input = amount_input;
-
-            set_input_styles(&mut self.address_input, self.active_input == 0);
-            set_input_styles(&mut self.amount_input, self.active_input == 1);
         }
     }
 
@@ -159,6 +170,29 @@ impl SendModal {
                 true
             }
         }
+    }
+
+    /// Get the form data if it's valid
+    fn get_form_data(&self) -> Result<(Address, u64), ModalErr> {
+        let address = self.address_input.lines().join("").trim().to_string();
+        if address.is_empty() {
+            return Err(ModalErr::EmptyAddress);
+        }
+
+        let address = Address::from_str(&address)
+            .and_then(|addr| addr.require_network(Network::Signet))
+            .map_err(|_| ModalErr::InvalidAddress(address))?;
+
+        let amount_str = self.amount_input.lines().join("").trim().to_string();
+        if amount_str.is_empty() {
+            return Err(ModalErr::EmptyAmount);
+        }
+
+        let amount = amount_str
+            .parse::<u64>()
+            .map_err(|_| ModalErr::InvalidAmount(amount_str))?;
+
+        Ok((address, amount))
     }
 
     /// Render the send bitcoin modal dialog
@@ -292,7 +326,7 @@ impl App {
         }
     }
 
-    pub fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<()> {
         let stdout = std::io::stdout();
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -300,7 +334,7 @@ impl App {
         // Main event loop
         while !self.should_quit {
             terminal.draw(|f| self.draw(f))?;
-            self.handle_events()?;
+            self.handle_events().await?;
         }
 
         Ok(())
@@ -334,10 +368,31 @@ impl App {
             .style(Style::default().fg(Color::Gray))
             .alignment(Alignment::Center);
 
+        // Draw toast notification if it exists and not expired
+        if let Some(toast) = &self.toast {
+            if !toast.is_expired() {
+                let notification = Paragraph::new(Line::from(vec![Span::from(toast)])).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .style(Style::default().bg(ratatui::style::Color::DarkGray)),
+                );
+
+                // Position the toast above the help bar
+                let area = Rect {
+                    x: size.width / 4,
+                    y: help_area.y - 4, // Position above help area
+                    width: size.width / 2,
+                    height: 3,
+                };
+                f.render_widget(notification, area);
+            } else {
+                // Clear expired toast
+                self.toast = None;
+            }
+        }
+
         // Draw the send modal if it's visible
         self.send_modal.render(f);
-
-        // Don't draw the rest of the UI if the modal is showing
         if self.send_modal.show_modal {
             return;
         }
@@ -354,28 +409,6 @@ impl App {
         // Draw the main content and help bar
         f.render_widget(main_block, content_area);
         f.render_widget(help_bar, help_area);
-
-        // Draw toast notification if it exists and not expired
-        if let Some(toast) = &self.toast {
-            if !toast.is_expired() {
-                let notification = Paragraph::new(Line::from(vec![Span::from(toast)])).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .style(Style::default().bg(ratatui::style::Color::DarkGray)),
-                );
-
-                let area = Rect {
-                    x: size.width / 4,
-                    y: content_area.y + content_area.height - 3,
-                    width: size.width / 2,
-                    height: 3,
-                };
-                f.render_widget(notification, area);
-            } else {
-                // Clear expired toast
-                self.toast = None;
-            }
-        }
 
         // Draw the left side (wallet info)
         self.draw_wallet_info(f, left);
@@ -487,7 +520,10 @@ impl App {
         match Clipboard::new() {
             Ok(mut clipboard) => {
                 if let Err(e) = clipboard.set_text(address.clone()) {
-                    self.show_toast(Toast::error(format!("Failed to copy to clipboard: {}", e)));
+                    self.show_toast(Toast::error(format!(
+                        "Failed to copy address to clipboard: {}",
+                        e
+                    )));
                 } else {
                     self.show_toast(Toast::success(format!(
                         "Address copied to clipboard: {}",
@@ -501,10 +537,55 @@ impl App {
         }
     }
 
+    /// Handle submission of the send form
+    async fn handle_send_submit(&mut self) -> bool {
+        match self.send_modal.get_form_data() {
+            Ok((address, amount)) => match self.wallet.send(&address, amount).await {
+                Ok(txid) => {
+                    self.show_toast(Toast::success(format!("Transaction {} broadcasted", txid)));
+                    self.send_modal.show_modal = false;
+                    match Clipboard::new() {
+                        Ok(mut clipboard) => {
+                            if let Err(e) = clipboard.set_text(txid.to_string()) {
+                                self.show_toast(Toast::error(format!(
+                                    "Failed to copy transaction ID to clipboard: {}",
+                                    e
+                                )));
+                            } else {
+                                self.show_toast(Toast::success(format!(
+                                    "Transaction ID copied to clipboard: {}",
+                                    txid
+                                )));
+                            }
+                        }
+                        Err(e) => {
+                            self.show_toast(Toast::error(format!(
+                                "Failed to access clipboard: {}",
+                                e
+                            )));
+                        }
+                    }
+                    true
+                }
+                Err(e) => {
+                    self.show_toast(Toast::error(format!("Failed to send: {}", e)));
+                    false
+                }
+            },
+            Err(e) => {
+                self.show_toast(Toast::error(e.to_string()));
+                false
+            }
+        }
+    }
+
     /// Handle key press events
-    fn handle_key_event(&mut self, key: KeyEvent) -> bool {
+    async fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         if self.send_modal.show_modal {
-            return self.send_modal.handle_input(key);
+            return match key.code {
+                KeyCode::Enter => self.handle_send_submit().await,
+                _ => self.send_modal.handle_input(key),
+            };
         }
 
         match key.code {
@@ -518,15 +599,14 @@ impl App {
         }
         true
     }
-
     /// Handle all input events
-    fn handle_events(&mut self) -> Result<()> {
+    async fn handle_events(&mut self) -> Result<()> {
         if !event::poll(std::time::Duration::from_millis(100))? {
             return Ok(());
         }
 
         if let Event::Key(key) = event::read()? {
-            let event_handled = self.handle_key_event(key);
+            let event_handled = self.handle_key_event(key).await;
             if event_handled {
                 return Ok(());
             }

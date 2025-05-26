@@ -6,11 +6,11 @@ use std::{path::Path, str::FromStr};
 use anyhow::{Context, Result};
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_wallet::bitcoin::bip32::{Xpriv, Xpub};
-use bdk_wallet::bitcoin::{self, Amount, Network, TxIn};
+use bdk_wallet::bitcoin::{self, Address, Amount, FeeRate, Network, TxIn};
 use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::template::{Bip84, Bip84Public};
-use bdk_wallet::{AddressInfo, KeychainKind, PersistedWallet, Wallet, WalletTx};
+use bdk_wallet::{AddressInfo, KeychainKind, PersistedWallet, SignOptions, Wallet, WalletTx};
 use rand::Rng;
 use tokio::fs;
 
@@ -157,6 +157,34 @@ impl AppWallet {
         wallet.persist(&mut conn)?;
 
         Ok(address)
+    }
+
+    pub async fn send(&self, address: &Address, amount: u64) -> Result<bitcoin::Txid> {
+        let tx = {
+            let mut wallet = self.wallet.write().unwrap();
+
+            let mut builder = wallet.build_tx();
+            builder
+                .add_recipient(address.script_pubkey(), Amount::from_sat(amount))
+                .fee_rate(FeeRate::from_sat_per_vb(2).unwrap());
+            let mut psbt = builder.finish()?;
+
+            if !wallet.sign(&mut psbt, SignOptions::default())? {
+                return Err(anyhow::anyhow!("Failed to sign transaction"));
+            }
+
+            psbt.extract_tx()?
+        };
+
+        self.esplora.broadcast(&tx).await?;
+
+        {
+            let mut wallet = self.wallet.write().unwrap();
+            let mut conn = self.conn.lock().unwrap();
+            wallet.persist(&mut conn)?;
+        }
+
+        Ok(tx.compute_txid())
     }
 }
 

@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     // Create and run the app
     let mut app = App::new(wallet, config);
-    app.run()?;
+    app.run().await?;
 
     // Restore terminal
     disable_raw_mode()?;
