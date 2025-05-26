@@ -3,10 +3,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use arboard::Clipboard;
-use bdk_wallet::bitcoin::{Address, Network};
+use bdk_wallet::bitcoin::{Address, Amount, Denomination, Network, SignedAmount};
 use crossterm::event::KeyEvent;
 use crossterm::event::{self, Event, KeyCode};
 use ratatui::text::Text;
+use ratatui::widgets::Padding;
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
@@ -348,19 +349,17 @@ impl App {
             Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(size);
 
         // Main container with border around the content area
-        let main_block = Block::default()
-            .borders(Borders::ALL)
-            .title("Plank - Mutinynet Wallet");
+        let main_block = Block::bordered().title("Plank - Mutinynet Wallet");
 
         // Help bar at the bottom
         let help_text = Line::from(vec![
-            Span::styled("q:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("q:", Style::default().bold()),
             Span::raw(" Quit  "),
-            Span::styled("r:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("r:", Style::default().bold()),
             Span::raw(" Receive  "),
-            Span::styled("s:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("s:", Style::default().bold()),
             Span::raw(" Send  "),
-            Span::styled("Esc:", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("Esc:", Style::default().bold()),
             Span::raw(" Cancel"),
         ]);
 
@@ -413,7 +412,11 @@ impl App {
         // Draw the left side (wallet info)
         self.draw_wallet_info(f, left);
         // Draw the right side
-        self.draw_transactions(f, right);
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
+
+        self.draw_transactions(f, top);
+        self.draw_utxos(f, bottom);
     }
 
     fn draw_wallet_info(&self, f: &mut Frame, area: Rect) {
@@ -441,13 +444,13 @@ impl App {
         ]);
 
         // Balance
-        let balance_text = format!("Balance: {}", self.wallet.get_balance().display_dynamic());
+        let balance_text = format!("Balance: {}", format_amount(&self.wallet.get_balance()));
         let balance_text = Line::from(Span::styled(balance_text, Style::default().green()));
 
         // Pending
         let pending_text = format!(
             "Pending: {}",
-            self.wallet.get_pending_balance().display_dynamic()
+            format_amount(&self.wallet.get_pending_balance())
         );
         let pending_text = Line::from(Span::styled(pending_text, Style::default().yellow()));
 
@@ -473,32 +476,58 @@ impl App {
             .map(|tx| {
                 Row::new(vec![
                     Cell::from(tx.id.to_string()),
-                    Cell::from(tx.memo.clone()),
-                    Cell::from(tx.incoming_amount.display_dynamic().to_string()),
-                    Cell::from(tx.outgoing_amount.display_dynamic().to_string()),
+                    Cell::from(Text::from(format_signed_amount(&tx.net_amount())).right_aligned()),
                 ])
             })
             .collect();
 
         // Create the table
-        let table = Table::new(
-            rows,
-            &[
-                Constraint::Length(25),
-                Constraint::Min(15),
-                Constraint::Percentage(30),
-                Constraint::Percentage(30),
-            ],
-        )
-        .header(
-            Row::new(vec!["ID", "Memo", "Incoming", "Outgoing"])
-                .style(Style::default().add_modifier(Modifier::BOLD))
-                .bottom_margin(1),
-        )
-        .block(Block::default())
-        .column_spacing(1);
+        let table = Table::new(rows, &[Constraint::Length(40), Constraint::Min(1)])
+            .header(
+                Row::new(vec!["ID".into(), Text::from("Net").right_aligned()])
+                    .style(Style::default().bold())
+                    .bottom_margin(1),
+            )
+            .block(
+                Block::bordered()
+                    .title("Transactions")
+                    .padding(Padding::horizontal(1)),
+            )
+            .column_spacing(1);
 
         f.render_widget(table, tx_table);
+    }
+
+    fn draw_utxos(&self, f: &mut Frame, area: Rect) {
+        let [utxo_table] = Layout::vertical([Constraint::Min(1)]).areas(area);
+
+        let rows: Vec<Row> = self
+            .wallet
+            .get_utxos()
+            .iter()
+            .map(|tx| {
+                Row::new(vec![
+                    Cell::from(tx.outpoint.to_string()),
+                    Cell::from(Text::from(format_amount(&tx.txout.value)).right_aligned()),
+                ])
+            })
+            .collect();
+
+        // Create the table
+        let table = Table::new(rows, &[Constraint::Length(64), Constraint::Min(25)])
+            .header(
+                Row::new(vec!["ID".into(), Text::from("Value").right_aligned()])
+                    .style(Style::default().bold())
+                    .bottom_margin(1),
+            )
+            .block(
+                Block::bordered()
+                    .title("UTXOs")
+                    .padding(Padding::horizontal(1)),
+            )
+            .column_spacing(1);
+
+        f.render_widget(table, utxo_table);
     }
 
     /// Show a toast notification
@@ -614,4 +643,12 @@ impl App {
 
         Ok(())
     }
+}
+
+fn format_amount(amount: &Amount) -> String {
+    format!("{} sats", amount.display_in(Denomination::SAT))
+}
+
+fn format_signed_amount(amount: &SignedAmount) -> String {
+    format!("{} sats", amount.display_in(Denomination::SAT))
 }

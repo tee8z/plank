@@ -6,11 +6,13 @@ use std::{path::Path, str::FromStr};
 use anyhow::{Context, Result};
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_wallet::bitcoin::bip32::{Xpriv, Xpub};
-use bdk_wallet::bitcoin::{self, Address, Amount, FeeRate, Network, TxIn};
+use bdk_wallet::bitcoin::{self, Address, Amount, FeeRate, Network, SignedAmount, TxIn};
 use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::rusqlite::Connection;
 use bdk_wallet::template::{Bip84, Bip84Public};
-use bdk_wallet::{AddressInfo, KeychainKind, PersistedWallet, SignOptions, Wallet, WalletTx};
+use bdk_wallet::{
+    AddressInfo, KeychainKind, LocalOutput, PersistedWallet, SignOptions, Wallet, WalletTx,
+};
 use rand::Rng;
 use tokio::fs;
 
@@ -149,6 +151,11 @@ impl AppWallet {
             .collect()
     }
 
+    pub fn get_utxos(&self) -> Vec<LocalOutput> {
+        let wallet = self.wallet.read().unwrap();
+        wallet.list_unspent().collect()
+    }
+
     pub fn new_address(&self) -> Result<AddressInfo> {
         let mut wallet = self.wallet.write().unwrap();
         let address = wallet.reveal_next_address(KeychainKind::External);
@@ -202,12 +209,12 @@ impl std::ops::Deref for Txid {
 impl std::fmt::Display for Txid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = self.0.to_string();
-        if s.len() <= 20 {
+        if s.len() <= 30 {
             // If the string is short, just display it as is
             write!(f, "{}", s)
         } else {
-            // Otherwise, show first 10 and last 10 characters with ... in between
-            write!(f, "{}...{}", &s[..10], &s[s.len() - 10..])
+            // Otherwise, show first 15 and last 15 characters with ... in between
+            write!(f, "{}...{}", &s[..15], &s[s.len() - 15..])
         }
     }
 }
@@ -215,7 +222,6 @@ impl std::fmt::Display for Txid {
 #[derive(Debug, Clone)]
 pub struct Transaction {
     pub id: Txid,
-    pub memo: String,
     pub incoming_amount: Amount,
     pub outgoing_amount: Amount,
 }
@@ -233,21 +239,33 @@ impl Transaction {
         let outgoing_amount = tx
             .input
             .iter()
-            .filter(|input| wallet.is_mine(input.script_sig.clone()))
-            .map(|input| get_input_value(wallet, input))
+            .filter_map(|input| get_input_value(wallet, input))
             .sum();
 
         Self {
             id: Txid(tx.compute_txid()),
-            memo: "".to_string(),
             incoming_amount,
             outgoing_amount,
         }
     }
+
+    pub fn net_amount(&self) -> SignedAmount {
+        let incoming_amount = self.incoming_amount.to_signed().unwrap();
+        let outgoing_amount = self.outgoing_amount.to_signed().unwrap();
+
+        if incoming_amount > outgoing_amount {
+            incoming_amount - outgoing_amount
+        } else {
+            outgoing_amount - incoming_amount
+        }
+    }
 }
 
-fn get_input_value(wallet: &PersistedWallet<Connection>, input: &TxIn) -> Amount {
-    wallet.get_utxo(input.previous_output).unwrap().txout.value
+fn get_input_value(wallet: &PersistedWallet<Connection>, input: &TxIn) -> Option<Amount> {
+    wallet
+        .list_output()
+        .find(|output| output.outpoint == input.previous_output)
+        .map(|output| output.txout.value)
 }
 
 async fn create_wallet(
