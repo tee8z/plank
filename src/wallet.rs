@@ -42,9 +42,9 @@ impl AppWallet {
 
         let (mut wallet, created) = match fs::read_to_string(&key_path).await {
             Ok(contents) if contents.starts_with("tprv") => {
-                (load_wallet_with_pvt(&mut conn, &contents)?, false)
+                load_wallet_with_pvt(&mut conn, &contents)?
             }
-            Ok(contents) => (load_wallet_with_pub(&mut conn, &contents)?, false),
+            Ok(contents) => load_wallet_with_pub(&mut conn, &contents)?,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 (create_wallet(&mut conn, &key_path).await?, true)
             }
@@ -288,35 +288,37 @@ async fn create_wallet(
 fn load_wallet_with_pvt(
     conn: &mut Connection,
     key_contents: &str,
-) -> Result<PersistedWallet<Connection>> {
+) -> Result<(PersistedWallet<Connection>, bool)> {
     let key = Xpriv::from_str(key_contents)?;
     let d1 = Bip84(key, KeychainKind::External);
     let d2 = Bip84(key, KeychainKind::Internal);
 
     if let Some(wallet) = load_wallet(conn, d1.clone(), d2.clone(), true)? {
-        Ok(wallet)
+        Ok((wallet, false))
     } else {
         // no changeset. file was created and then tui booted up. consider it an import of a key.
         // so we need to create a new wallet
-        init_new_wallet(conn, d1, d2)
+        let wallet = init_new_wallet(conn, d1, d2)?;
+        Ok((wallet, true))
     }
 }
 
 fn load_wallet_with_pub(
     conn: &mut Connection,
     key_contents: &str,
-) -> Result<PersistedWallet<Connection>> {
+) -> Result<(PersistedWallet<Connection>, bool)> {
     let key = Xpub::from_str(key_contents)?;
     let fingerprint = key.fingerprint();
     let d1 = Bip84Public(key, fingerprint, KeychainKind::External);
     let d2 = Bip84Public(key, fingerprint, KeychainKind::Internal);
 
     if let Some(wallet) = load_wallet(conn, d1.clone(), d2.clone(), false)? {
-        Ok(wallet)
+        Ok((wallet, false))
     } else {
         // no changeset. file was created and then tui booted up. consider it an import of a key.
         // so we need to create a new wallet
-        init_new_wallet(conn, d1, d2)
+        let wallet = init_new_wallet(conn, d1, d2)?;
+        Ok((wallet, true))
     }
 }
 
