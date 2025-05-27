@@ -51,7 +51,7 @@ impl AppWallet {
             Err(e) => return Err(e).context("Failed to read key file")?,
         };
 
-        let esplora = esplora_client::Builder::new(&esplora_url).build_async()?;
+        let esplora = esplora_client::Builder::new(esplora_url).build_async()?;
         if created {
             let update = esplora.full_scan(wallet.start_full_scan(), 10, 3).await?;
             wallet.apply_update(update)?;
@@ -147,7 +147,7 @@ impl AppWallet {
         wallet
             .transactions_sort_by(|tx1, tx2| tx2.chain_position.cmp(&tx1.chain_position))
             .iter()
-            .map(|tx| Transaction::from_wallet_transaction(&tx, &*wallet))
+            .map(|tx| Transaction::from_wallet_transaction(tx, &wallet))
             .collect()
     }
 
