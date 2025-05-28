@@ -1,21 +1,26 @@
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::{
     prelude::*,
-    widgets::{Block, Cell, Padding, Row, Table},
+    widgets::{Block, Cell, Padding, Row, Table, TableState},
 };
 
-use crate::utils::format_amount;
+use crate::utils::{format_amount, short_outpoint};
 use crate::wallet::AppWallet;
 
 pub struct UtxosTable {
     wallet: AppWallet,
+    state: TableState,
 }
 
 impl UtxosTable {
     pub fn new(wallet: AppWallet) -> Self {
-        Self { wallet }
+        Self {
+            wallet,
+            state: TableState::default().with_selected(0),
+        }
     }
 
-    pub fn render(&self, f: &mut Frame, area: Rect) {
+    pub fn render(&mut self, f: &mut Frame, area: Rect, active: bool) {
         let [utxo_table] = Layout::vertical([Constraint::Min(1)]).areas(area);
 
         let rows: Vec<Row> = self
@@ -24,26 +29,55 @@ impl UtxosTable {
             .iter()
             .map(|tx| {
                 Row::new(vec![
-                    Cell::from(tx.outpoint.to_string()),
+                    Cell::from(short_outpoint(&tx.outpoint)),
                     Cell::from(Text::from(format_amount(&tx.txout.value)).right_aligned()),
                 ])
             })
             .collect();
 
+        let mut block = Block::bordered()
+            .title("UTXOs")
+            .padding(Padding::horizontal(1));
+
+        if active {
+            block = block.border_style(Style::default().red());
+        }
+
         // Create the table
-        let table = Table::new(rows, &[Constraint::Length(64), Constraint::Min(25)])
+        let mut table = Table::new(rows, &[Constraint::Length(64), Constraint::Min(25)])
             .header(
                 Row::new(vec!["ID".into(), Text::from("Value").right_aligned()])
                     .style(Style::default().bold())
                     .bottom_margin(1),
             )
-            .block(
-                Block::bordered()
-                    .title("UTXOs")
-                    .padding(Padding::horizontal(1)),
-            )
+            .block(block)
             .column_spacing(1);
 
-        f.render_widget(table, utxo_table);
+        let mut style = Style::default();
+        if active {
+            style = style.reversed();
+        }
+
+        table = table.highlight_style(style);
+
+        f.render_stateful_widget(table, utxo_table, &mut self.state);
+    }
+
+    pub fn handle_input(&mut self, input: KeyEvent) -> bool {
+        let count = self.wallet.get_utxos().len();
+
+        match input.code {
+            KeyCode::Down => {
+                self.state
+                    .select(Some((self.state.selected().unwrap() + 1) % count));
+                true
+            }
+            KeyCode::Up => {
+                self.state
+                    .select(Some((self.state.selected().unwrap() + count - 1) % count));
+                true
+            }
+            _ => false,
+        }
     }
 }

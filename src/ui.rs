@@ -9,6 +9,26 @@ use crate::components::*;
 use crate::config::Config;
 use crate::wallet::AppWallet;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum SelectableComponent {
+    #[default]
+    TransactionsTable,
+    UtxosTable,
+}
+
+impl SelectableComponent {
+    fn next(&self) -> Self {
+        match self {
+            Self::TransactionsTable => Self::UtxosTable,
+            Self::UtxosTable => Self::TransactionsTable,
+        }
+    }
+
+    fn prev(&self) -> Self {
+        self.next()
+    }
+}
+
 pub struct App {
     pub should_quit: bool,
     wallet: AppWallet,
@@ -17,6 +37,7 @@ pub struct App {
     transactions_table: TransactionsTable,
     wallet_info: WalletInfo,
     utxos_table: UtxosTable,
+    selected_component: SelectableComponent,
 }
 
 impl App {
@@ -29,6 +50,7 @@ impl App {
             transactions_table: TransactionsTable::new(wallet.clone()),
             wallet_info: WalletInfo::new(&config.name, wallet.clone()),
             utxos_table: UtxosTable::new(wallet),
+            selected_component: SelectableComponent::default(),
         }
     }
 
@@ -120,8 +142,16 @@ impl App {
         let [top, bottom] =
             Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(right);
 
-        self.transactions_table.render(f, top);
-        self.utxos_table.render(f, bottom);
+        self.transactions_table.render(
+            f,
+            top,
+            self.selected_component == SelectableComponent::TransactionsTable,
+        );
+        self.utxos_table.render(
+            f,
+            bottom,
+            self.selected_component == SelectableComponent::UtxosTable,
+        );
     }
 
     /// Show a toast notification
@@ -212,6 +242,16 @@ impl App {
         }
 
         match key.code {
+            KeyCode::Down | KeyCode::Up | KeyCode::Char('o') => match self.selected_component {
+                SelectableComponent::TransactionsTable => {
+                    self.transactions_table.handle_input(key);
+                }
+                SelectableComponent::UtxosTable => {
+                    self.utxos_table.handle_input(key);
+                }
+            },
+            KeyCode::Left => self.selected_component = self.selected_component.prev(),
+            KeyCode::Right => self.selected_component = self.selected_component.next(),
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('r') => self.handle_new_address(),
             KeyCode::Char('s') => {
