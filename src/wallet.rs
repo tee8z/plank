@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use std::{path::Path, str::FromStr};
 
 use anyhow::{Context, Result};
@@ -29,6 +30,8 @@ pub struct AppWallet {
     esplora: esplora_client::AsyncClient,
     block_height: Arc<RwLock<u32>>,
     sync_status: Arc<RwLock<SyncStatus>>,
+    recent_transactions: Arc<RwLock<HashSet<bitcoin::Txid>>>,
+    recent_tx_timestamp: Arc<RwLock<SystemTime>>,
 }
 
 impl AppWallet {
@@ -41,10 +44,10 @@ impl AppWallet {
         let mut conn = tokio::task::spawn_blocking(move || Connection::open(db_path)).await??;
 
         let (mut wallet, created) = match fs::read_to_string(&key_path).await {
-            Ok(contents) if contents.starts_with("tprv") => {
-                load_wallet_with_pvt(&mut conn, &contents)?
+            Ok(contents) if contents.trim().starts_with("tprv") => {
+                load_wallet_with_pvt(&mut conn, contents.trim())?
             }
-            Ok(contents) => load_wallet_with_pub(&mut conn, &contents)?,
+            Ok(contents) => load_wallet_with_pub(&mut conn, contents.trim())?,
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 (create_wallet(&mut conn, &key_path).await?, true)
             }
@@ -66,6 +69,8 @@ impl AppWallet {
                 is_syncing: false,
                 last_sync: None,
             })),
+            recent_transactions: Arc::new(RwLock::new(HashSet::new())),
+            recent_tx_timestamp: Arc::new(RwLock::new(SystemTime::now())),
         };
 
         let app_wallet_clone = app_wallet.clone();
@@ -145,6 +150,8 @@ impl AppWallet {
     pub fn get_transactions(&self) -> Vec<Transaction> {
         let wallet = self.wallet.read().unwrap();
         wallet
+            // Sort by chain position in descending order (most recent first)
+            // Higher chain_position = more recent transaction
             .transactions_sort_by(|tx1, tx2| tx2.chain_position.cmp(&tx1.chain_position))
             .iter()
             .map(|tx| Transaction::from_wallet_transaction(tx, &wallet))
@@ -185,13 +192,167 @@ impl AppWallet {
 
         self.esplora.broadcast(&tx).await?;
 
+        let txid = tx.compute_txid();
+
         {
             let mut wallet = self.wallet.write().unwrap();
             let mut conn = self.conn.lock().unwrap();
             wallet.persist(&mut conn)?;
         }
 
-        Ok(tx.compute_txid())
+        // Mark this transaction as recently created
+        self.mark_transaction_as_recent(txid);
+
+        Ok(txid)
+    }
+
+    pub async fn split_utxos(
+        &self,
+        amounts: Vec<u64>,
+        use_change_addresses: bool,
+    ) -> Result<bitcoin::Txid> {
+        let tx = {
+            let mut wallet = self.wallet.write().unwrap();
+
+            let keychain_kind = if use_change_addresses {
+                KeychainKind::Internal
+            } else {
+                KeychainKind::External
+            };
+
+            let mut addresses = Vec::new();
+            for _ in &amounts {
+                let address_info = wallet.reveal_next_address(keychain_kind);
+                addresses.push(address_info.address);
+            }
+
+            let mut builder = wallet.build_tx();
+
+            // Add each amount as a separate output to addresses controlled by this wallet
+            for (amount, address) in amounts.iter().zip(addresses.iter()) {
+                builder.add_recipient(address.script_pubkey(), Amount::from_sat(*amount));
+            }
+
+            // TODO(@tee8z): make fee rate configurable
+            builder.fee_rate(FeeRate::from_sat_per_vb(2).unwrap());
+
+            let mut psbt = builder.finish()?;
+
+            if !wallet.sign(&mut psbt, SignOptions::default())? {
+                return Err(anyhow::anyhow!("Failed to sign splitting transaction"));
+            }
+
+            psbt.extract_tx()?
+        };
+
+        // Broadcast the transaction
+        self.esplora.broadcast(&tx).await?;
+
+        let txid = tx.compute_txid();
+
+        // Persist wallet state
+        {
+            let mut wallet = self.wallet.write().unwrap();
+            let mut conn = self.conn.lock().unwrap();
+            wallet.persist(&mut conn)?;
+        }
+
+        // Mark this transaction as recently created
+        self.mark_transaction_as_recent(txid);
+
+        Ok(txid)
+    }
+
+    pub async fn split_largest_utxo_equally(
+        &self,
+        num_outputs: usize,
+        use_change_addresses: bool,
+    ) -> Result<bitcoin::Txid> {
+        if num_outputs == 0 {
+            return Err(anyhow::anyhow!("Number of outputs must be greater than 0"));
+        }
+
+        // Find the largest UTXO
+        let largest_utxo = {
+            let wallet = self.wallet.read().unwrap();
+            wallet
+                .list_unspent()
+                .max_by_key(|utxo| utxo.txout.value.to_sat())
+                .ok_or_else(|| anyhow::anyhow!("No UTXOs available to split"))?
+        };
+
+        // Calculate amount per output (leaving some for fees)
+        let total_amount = largest_utxo.txout.value.to_sat();
+        let estimated_fee = 1000; // Conservative estimate for fees in satoshis
+
+        if total_amount <= estimated_fee {
+            return Err(anyhow::anyhow!(
+                "UTXO too small to split after accounting for fees"
+            ));
+        }
+
+        let amount_per_output = (total_amount - estimated_fee) / num_outputs as u64;
+
+        if amount_per_output == 0 {
+            return Err(anyhow::anyhow!(
+                "Amount per output would be 0 after splitting"
+            ));
+        }
+
+        // Create vector of equal amounts
+        let amounts = vec![amount_per_output; num_outputs];
+
+        self.split_utxos(amounts, use_change_addresses).await
+    }
+
+    pub async fn create_utxo_mix(
+        &self,
+        small_count: usize,
+        medium_count: usize,
+        large_count: usize,
+        use_change_addresses: bool,
+    ) -> Result<bitcoin::Txid> {
+        let mut amounts = Vec::new();
+
+        // Small UTXOs: 100,000 sats (0.001 BTC)
+        amounts.extend(vec![100_000; small_count]);
+
+        // Medium UTXOs: 1,000,000 sats (0.01 BTC)
+        amounts.extend(vec![1_000_000; medium_count]);
+
+        // Large UTXOs: 10,000,000 sats (0.1 BTC)
+        amounts.extend(vec![10_000_000; large_count]);
+
+        if amounts.is_empty() {
+            return Err(anyhow::anyhow!("At least one output must be specified"));
+        }
+
+        self.split_utxos(amounts, use_change_addresses).await
+    }
+
+    fn mark_transaction_as_recent(&self, txid: bitcoin::Txid) {
+        let mut recent_transactions = self.recent_transactions.write().unwrap();
+        let mut recent_tx_timestamp = self.recent_tx_timestamp.write().unwrap();
+
+        recent_transactions.clear(); // Only keep the most recent transaction highlighted
+        recent_transactions.insert(txid);
+        *recent_tx_timestamp = SystemTime::now();
+    }
+
+    pub fn is_transaction_recent(&self, txid: &bitcoin::Txid) -> bool {
+        let recent_transactions = self.recent_transactions.read().unwrap();
+        let recent_tx_timestamp = self.recent_tx_timestamp.read().unwrap();
+
+        // Highlight for 30 seconds
+        if recent_tx_timestamp
+            .elapsed()
+            .unwrap_or(Duration::from_secs(0))
+            > Duration::from_secs(30)
+        {
+            return false;
+        }
+
+        recent_transactions.contains(txid)
     }
 }
 

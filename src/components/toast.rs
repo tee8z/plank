@@ -34,12 +34,29 @@ impl Toast {
         }
     }
 
+    pub fn new_with_duration(
+        message: impl Into<String>,
+        level: ToastLevel,
+        duration: Duration,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            level,
+            timestamp: Instant::now(),
+            duration,
+        }
+    }
+
     pub fn info(message: impl Into<String>) -> Self {
         Self::new(message, ToastLevel::Info)
     }
 
     pub fn success(message: impl Into<String>) -> Self {
         Self::new(message, ToastLevel::Success)
+    }
+
+    pub fn success_long(message: impl Into<String>) -> Self {
+        Self::new_with_duration(message, ToastLevel::Success, Duration::from_secs(10))
     }
 
     pub fn warning(message: impl Into<String>) -> Self {

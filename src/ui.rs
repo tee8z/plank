@@ -34,6 +34,7 @@ pub struct App {
     wallet: AppWallet,
     toast: Option<Toast>,
     send_modal: SendModal,
+    split_modal: SplitModal,
     transactions_table: TransactionsTable,
     wallet_info: WalletInfo,
     utxos_table: UtxosTable,
@@ -47,6 +48,7 @@ impl App {
             wallet: wallet.clone(),
             toast: None,
             send_modal: SendModal::default(),
+            split_modal: SplitModal::default(),
             transactions_table: TransactionsTable::new(wallet.clone()),
             wallet_info: WalletInfo::new(&config.name, wallet.clone()),
             utxos_table: UtxosTable::new(wallet),
@@ -86,6 +88,8 @@ impl App {
             Span::raw(" Receive  "),
             Span::styled("s:", Style::default().bold()),
             Span::raw(" Send  "),
+            Span::styled("u:", Style::default().bold()),
+            Span::raw(" Split UTXOs  "),
             Span::styled("Esc:", Style::default().bold()),
             Span::raw(" Cancel"),
         ]);
@@ -120,6 +124,12 @@ impl App {
         // Draw the send modal if it's visible
         self.send_modal.render(f);
         if self.send_modal.visible() {
+            return;
+        }
+
+        // Draw the split modal if it's visible
+        self.split_modal.render(f);
+        if self.split_modal.visible() {
             return;
         }
 
@@ -195,7 +205,10 @@ impl App {
         match self.send_modal.get_form_data() {
             Ok((address, amount)) => match self.wallet.send(&address, amount).await {
                 Ok(txid) => {
-                    self.show_toast(Toast::success(format!("Transaction {} broadcasted", txid)));
+                    self.show_toast(Toast::success_long(format!(
+                        "Transaction {} broadcasted",
+                        txid
+                    )));
                     self.send_modal.toggle();
                     match Clipboard::new() {
                         Ok(mut clipboard) => {
@@ -205,7 +218,7 @@ impl App {
                                     e
                                 )));
                             } else {
-                                self.show_toast(Toast::success(format!(
+                                self.show_toast(Toast::success_long(format!(
                                     "Transaction ID copied to clipboard: {}",
                                     txid
                                 )));
@@ -241,6 +254,13 @@ impl App {
             };
         }
 
+        if self.split_modal.visible() {
+            return match key.code {
+                KeyCode::Enter => self.handle_split_submit().await,
+                _ => self.split_modal.handle_input(key),
+            };
+        }
+
         match key.code {
             KeyCode::Down | KeyCode::Up | KeyCode::Char('o') => match self.selected_component {
                 SelectableComponent::TransactionsTable => {
@@ -258,10 +278,68 @@ impl App {
                 self.send_modal.toggle();
                 return false; // Event handled, stop further processing
             }
+            KeyCode::Char('u') => {
+                self.split_modal.toggle();
+                return false; // Event handled, stop further processing
+            }
             _ => {}
         }
         true
     }
+
+    async fn handle_split_submit(&mut self) -> bool {
+        use crate::components::{SplitMode, Toast};
+
+        let result = match self.split_modal.get_mode() {
+            SplitMode::EqualSplit => {
+                let count = match self.split_modal.get_equal_split_count() {
+                    Ok(count) => count,
+                    Err(e) => {
+                        self.show_toast(Toast::error(format!("Error: {}", e)));
+                        return false;
+                    }
+                };
+
+                self.wallet
+                    .split_largest_utxo_equally(count, self.split_modal.use_change_addresses())
+                    .await
+            }
+            SplitMode::CustomMix => {
+                let (small, medium, large) = match self.split_modal.get_custom_mix() {
+                    Ok(counts) => counts,
+                    Err(e) => {
+                        self.show_toast(Toast::error(format!("Error: {}", e)));
+                        return false;
+                    }
+                };
+
+                self.wallet
+                    .create_utxo_mix(
+                        small,
+                        medium,
+                        large,
+                        self.split_modal.use_change_addresses(),
+                    )
+                    .await
+            }
+        };
+
+        match result {
+            Ok(txid) => {
+                self.show_toast(Toast::success_long(format!(
+                    "UTXO split successful! TXID: {}",
+                    txid
+                )));
+                self.split_modal.toggle();
+            }
+            Err(e) => {
+                self.show_toast(Toast::error(format!("Split failed: {:#}", e)));
+            }
+        }
+
+        true
+    }
+
     /// Handle all input events
     async fn handle_events(&mut self) -> Result<()> {
         if !event::poll(std::time::Duration::from_millis(100))? {
