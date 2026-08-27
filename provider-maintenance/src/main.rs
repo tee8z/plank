@@ -2314,7 +2314,11 @@ fn batch_manifest_path(artifact_dir: &Path, plan_digest: &str) -> PathBuf {
 }
 
 fn maintenance_artifact_digest(artifact: &MaintenanceArtifact) -> Result<String> {
-    Ok(sha256::Hash::hash(&serde_json::to_vec(artifact)?).to_string())
+    // The exact integer fee and signed transaction commit the real fee rate. Exclude only its
+    // derived f64 display field so this digest is stable across a JSON serde round trip.
+    let mut commitment = artifact.clone();
+    commitment.fee_rate_sat_vb = 0.0;
+    Ok(sha256::Hash::hash(&serde_json::to_vec(&commitment)?).to_string())
 }
 
 fn persist_batch_manifest(path: &Path, manifest: &BatchSetManifest, create: bool) -> Result<()> {
@@ -2360,13 +2364,14 @@ fn materialize_signed_record(artifact_dir: &Path, record: &mut SignedBatchRecord
     Ok(changed)
 }
 
-fn validate_signed_manifest_records(manifest: &BatchSetManifest) -> Result<()> {
+fn validate_signed_manifest_records(manifest: &mut BatchSetManifest) -> Result<bool> {
     ensure!(
         manifest.signed_artifacts.len() <= manifest.plan.batches.len(),
         "batch manifest has more signed records than planned batches"
     );
     let mut seen = HashSet::new();
-    for record in &manifest.signed_artifacts {
+    let mut normalized = false;
+    for record in &mut manifest.signed_artifacts {
         ensure!(
             seen.insert(record.batch_index),
             "batch manifest contains duplicate signed batch {}",
@@ -2380,12 +2385,18 @@ fn validate_signed_manifest_records(manifest: &BatchSetManifest) -> Result<()> {
         ensure!(
             batch.batch_index == record.batch_index
                 && record.txid == batch.unsigned_txid
-                && record.artifact_file == batch_artifact_file(batch)
-                && record.artifact_sha256 == maintenance_artifact_digest(&record.artifact)?,
+                && record.artifact_file == batch_artifact_file(batch),
             "signed batch {} record differs from its plan",
             record.batch_index
         );
         validate_batch_artifact_against_plan(&record.artifact, &manifest.plan, batch)?;
+        let stable_digest = maintenance_artifact_digest(&record.artifact)?;
+        if record.artifact_sha256 != stable_digest {
+            // Normalize an original f64-sensitive v4 commitment only after the exact plan
+            // binding and signed transaction have both validated.
+            record.artifact_sha256 = stable_digest;
+            normalized = true;
+        }
     }
     match manifest.status {
         BatchSetStatus::Signing => {
@@ -2408,7 +2419,7 @@ fn validate_signed_manifest_records(manifest: &BatchSetManifest) -> Result<()> {
             );
         }
     }
-    Ok(())
+    Ok(normalized)
 }
 
 fn initialize_or_resume_batch_manifest(
@@ -2454,8 +2465,9 @@ fn initialize_or_resume_batch_manifest(
                 && manifest.reserved_inputs_sha256 == reserved_inputs_sha256,
             "existing batch-set manifest does not reserve this exact approved plan"
         );
-        validate_signed_manifest_records(&manifest)?;
-        if materialize_signed_records(artifact_dir, &mut manifest)? {
+        let mut changed = validate_signed_manifest_records(&mut manifest)?;
+        changed |= materialize_signed_records(artifact_dir, &mut manifest)?;
+        if changed {
             persist_batch_manifest(&path, &manifest, false)?;
         }
         return Ok((path, manifest));
@@ -3409,7 +3421,7 @@ fn load_batch_manifest_for_artifact(
     artifact: &MaintenanceArtifact,
     confirmed_digest: Option<&str>,
 ) -> Result<BatchSetManifest> {
-    let manifest: BatchSetManifest = serde_json::from_slice(&fs::read(path)?)?;
+    let mut manifest: BatchSetManifest = serde_json::from_slice(&fs::read(path)?)?;
     ensure!(
         manifest.version == BATCH_SET_VERSION
             && manifest.plan_digest == manifest.plan.plan_digest
@@ -3428,31 +3440,15 @@ fn load_batch_manifest_for_artifact(
             && manifest.reserved_inputs_sha256 == reserved_inputs_digest(reserved.iter().copied())?,
         "batch manifest reserved input inventory is inconsistent"
     );
+    validate_signed_manifest_records(&mut manifest)?;
     ensure!(
         manifest.status == BatchSetStatus::FullySigned
-            && manifest.signed_artifacts.len() == manifest.plan.batches.len(),
-        "batch manifest is not fully signed; no artifact may be broadcast"
+            && manifest
+                .signed_artifacts
+                .iter()
+                .all(|record| record.materialized),
+        "batch manifest is not fully signed and materialized; no artifact may be broadcast"
     );
-    let mut seen_indices = HashSet::new();
-    for record in &manifest.signed_artifacts {
-        ensure!(
-            record.materialized && seen_indices.insert(record.batch_index),
-            "batch manifest has an unmaterialized or duplicate signed record"
-        );
-        let batch = manifest
-            .plan
-            .batches
-            .get(record.batch_index.saturating_sub(1))
-            .context("batch manifest signed record index is out of range")?;
-        ensure!(
-            batch.batch_index == record.batch_index
-                && record.txid == batch.unsigned_txid
-                && record.artifact_file == batch_artifact_file(batch)
-                && record.artifact_sha256 == maintenance_artifact_digest(&record.artifact)?,
-            "batch manifest signed record is inconsistent"
-        );
-        validate_batch_artifact_against_plan(&record.artifact, &manifest.plan, batch)?;
-    }
     let artifact_index = artifact
         .batch_index
         .context("version 4 artifact has no batch index")?;
