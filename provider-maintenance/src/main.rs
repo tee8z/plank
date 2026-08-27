@@ -33,7 +33,8 @@ const MAX_STANDARD_WEIGHT_WU: u64 = 400_000;
 const MAX_SIGNER_RESPONSE_BYTES: u64 = 1_048_576;
 const MAX_POST_SYNC_TIP_LAG: u32 = 12;
 const UTXO_SYNC_PARALLEL_REQUESTS: usize = 16;
-const PREPARE_CONFIRMATION: &str = "fulfillment-stopped,prepared-inputs-excluded,inputs-compliant";
+const PREPARE_CONFIRMATION: &str =
+    "wallet-spenders-paused,prepared-inputs-excluded,inputs-compliant";
 const BROADCAST_CONFIRMATION: &str = "exclusive-maintenance-window-active";
 
 #[derive(Debug, Parser)]
@@ -151,7 +152,7 @@ struct PrepareArgs {
     /// Hard cap below Bitcoin's 400,000-WU standardness limit.
     #[arg(long, default_value_t = 200_000)]
     max_weight_wu: u64,
-    /// Must equal `fulfillment-stopped,prepared-inputs-excluded,inputs-compliant` before signing.
+    /// Must confirm that wallet spenders are paused and prepared inputs are excluded.
     #[arg(long)]
     confirm_maintenance: Option<String>,
 }

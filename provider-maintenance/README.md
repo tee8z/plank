@@ -1,6 +1,6 @@
 # Provider wallet maintenance
 
-`plank-provider-maintenance` consolidates a stopped fulfillment BDK wallet in bounded transactions.
+`plank-provider-maintenance` consolidates a quiesced fulfillment BDK wallet in bounded transactions.
 It uses the same BDK wallet and SQLite versions as the backend.
 
 The tool has three separate commands:
@@ -28,19 +28,24 @@ sequenceDiagram
 
 ## Safety requirements
 
-WARNING: Stop every fulfillment replica that uses the wallet before you run `prepare`.
-An external transaction can conflict with a prepared fulfillment payment and cause a permanent failure.
+WARNING: Pause every process that can prepare, sign, or broadcast a spend from the wallet.
+A competing transaction can invalidate a maintenance artifact or a fulfillment payment.
 
-WARNING: Keep each signed artifact until its transaction confirms.
-Do not restart fulfillment after `prepare` unless you broadcast the artifact or permanently reserve all artifact inputs.
+Stopping every fulfillment replica is the simplest maintenance gate.
+For a staging-only online run, make each BDK-backed provider read-only and stop synthetic traffic.
+Also block explicit-provider sends, freeze the approved-payment set, and exclude every durable prepared input.
+Do not use read-only mode alone because an explicit provider request can bypass provider selection.
+
+WARNING: Keep the wallet-spender gate active until each signed transaction confirms.
+Keep each signed artifact until its transaction confirms.
 
 Before you start, complete these checks:
 
 - Stop new on-chain traffic.
-- Stop fulfillment after its active preparation workers drain.
+- Activate a wallet-spender gate before you create the snapshot.
 - Export every input from each durable BDK `PaymentPrepared` artifact.
 - Put the exported outpoints in one exclusion file.
-- Create a transactionally consistent SQLite snapshot while fulfillment is stopped.
+- Create a transactionally consistent SQLite snapshot while the wallet-spender gate is active.
 - Use an operator-controlled Esplora instance on the same network as the wallet.
 - Audit the selected inputs against the applicable compliance policy.
 
@@ -54,7 +59,7 @@ The tool also enforces these properties:
 - The two largest eligible outputs remain as a confirmed reserve by default.
 - A required exclusion manifest is recorded by count and SHA-256 digest.
 - Every known wallet UTXO is refreshed during `inspect`.
-- A refreshed snapshot can use chain-only updates while fulfillment remains stopped.
+- A refreshed snapshot can use chain-only updates while the wallet-spender gate remains active.
 - A create-only unsigned plan must exist before the signer receives the PSBT.
 - Each transaction contains at most 500 inputs and 100 outputs by default.
 - The signer cannot change the inputs, outputs, sequences, version, or lock time.
@@ -98,7 +103,7 @@ Run `inspect` before you sign a transaction:
 The JSON report includes the synchronized height, balance, eligible output count, batch count, and a known wallet destination.
 The bounded sync checks every UTXO already known to the snapshot.
 It can discover a spend of a known output without rescanning approximately 66,000 historical scripts.
-It intentionally does not discover a new or resurrected output, so omitted funds remain untouched.
+It does not guarantee discovery of every new or resurrected output, so omitted funds remain untouched.
 After the outpoint sync, the tool performs a chain-only refresh and permits at most 12 blocks of lag.
 It also uses live outspend checks before signing.
 
@@ -160,13 +165,13 @@ Then sign the exact approved plan:
   --fee-rate-sat-vb 3 \
   --max-fee-sats 200000 \
   --max-weight-wu 200000 \
-  --confirm-maintenance 'fulfillment-stopped,prepared-inputs-excluded,inputs-compliant'
+  --confirm-maintenance 'wallet-spenders-paused,prepared-inputs-excluded,inputs-compliant'
 ```
 
 Review the signed artifact. Verify its destination, output values, final fee, weight, and txid.
 
 `--reuse-synced-snapshot` is valid only after `inspect` completed against that exact snapshot.
-Keep fulfillment stopped for the whole sequence.
+Keep the wallet-spender gate active for the whole sequence.
 The option skips the repeated all-known-UTXO refresh, updates the chain checkpoint, and still checks every selected outpoint live before signing.
 
 ## Broadcast one batch
@@ -191,7 +196,7 @@ It also excludes all prior maintenance inputs and outputs.
 After the final transaction confirms, synchronize the snapshot again with `inspect`.
 Verify the expected balance and output count.
 
-Restart fulfillment only after these conditions are true:
+Remove the wallet-spender gate only after these conditions are true:
 
 - No signed artifact remains unbroadcast.
 - Every maintenance transaction is confirmed.
@@ -206,16 +211,16 @@ Enable low-rate traffic only after one receive and one send succeed.
 
 | Failure | Required action |
 | --- | --- |
-| `inspect` reports tip lag | Keep fulfillment stopped and repeat the synchronization. |
+| `inspect` reports tip lag | Keep wallet spenders paused and repeat the synchronization. |
 | `prepare` reports a spent input | Refresh the exclusion set and create a new snapshot before signing. |
 | Signer request fails | Do not create or broadcast an artifact. Diagnose the signer authentication or wallet key. |
-| Artifact write fails after signing | Keep fulfillment stopped. Repeat signing only from the same durable approved plan. |
+| Artifact write fails after signing | Keep wallet spenders paused. Repeat signing only from the same durable approved plan. |
 | Broadcast returns an error | Query the exact txid. Do not replan while publication is ambiguous. |
 | Competing spend is present | Stop the maintenance run and reconcile the owner of that outpoint. |
-| Transaction is accepted but unconfirmed | Keep fulfillment stopped and rebroadcast only the exact artifact. |
+| Transaction is accepted but unconfirmed | Keep wallet spenders paused and rebroadcast only the exact artifact. |
 
 CAUTION: A confirmed Bitcoin transaction cannot be rolled back.
 A database snapshot is a recovery aid, not an on-chain rollback mechanism.
 
 CAUTION: The filename guard and symbolic-link check cannot detect a hard link to a live database.
-Keep the snapshot on separate storage while fulfillment is stopped.
+Keep the snapshot on separate storage while the wallet-spender gate is active.
