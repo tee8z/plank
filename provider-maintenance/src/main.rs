@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::ops::Range;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -30,7 +31,10 @@ use serde::{Deserialize, Serialize};
 
 const ARTIFACT_VERSION: u32 = 3;
 const LEGACY_ARTIFACT_VERSION: u32 = 2;
+const BATCH_SET_VERSION: u32 = 4;
 const MAX_STANDARD_WEIGHT_WU: u64 = 400_000;
+const DEFAULT_MAX_SIGNER_REQUEST_BYTES: usize = 900 * 1024;
+const ABSOLUTE_MAX_SIGNER_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_SIGNER_RESPONSE_BYTES: u64 = 1_048_576;
 const MAX_POST_SYNC_TIP_LAG: u32 = 12;
 const UTXO_SYNC_PARALLEL_REQUESTS: usize = 16;
@@ -63,7 +67,7 @@ struct Cli {
 enum Command {
     /// Inspect an offline provider-wallet snapshot without signing.
     Inspect(InspectArgs),
-    /// Prepare and remotely sign one immutable maintenance transaction.
+    /// Prepare and remotely sign an immutable maintenance plan.
     Prepare(Box<PrepareArgs>),
     /// Revalidate and broadcast one prepared artifact.
     Broadcast(BroadcastArgs),
@@ -107,7 +111,7 @@ struct PrepareArgs {
     /// Frozen prepared-payment `txid:vout` manifest. Bridge mode requires zero entries.
     #[arg(long)]
     exclude_outpoints: PathBuf,
-    /// Artifact directory. Bridge mode requires this directory to be completely empty.
+    /// Artifact directory. A new full-drain plan requires this directory to be empty.
     #[arg(long)]
     artifact_dir: PathBuf,
     /// Reuse a snapshot that completed `inspect`; refresh only its chain tip and live outspends.
@@ -143,7 +147,7 @@ struct PrepareArgs {
     /// Require an exact eligible-source-UTXO drain. Bridge mode permits no exclusions.
     #[arg(long)]
     require_drain_all: bool,
-    /// Exact output count for wallet reset. Must not exceed `max_outputs`.
+    /// Exact output count across the complete wallet-reset batch set.
     #[arg(long)]
     reset_output_count: Option<usize>,
     /// Print and optionally save the exact unsigned plan without calling the signer.
@@ -155,6 +159,9 @@ struct PrepareArgs {
     /// Repeat the unsigned transaction ID printed by `--dry-run` before signing.
     #[arg(long)]
     confirm_plan_txid: Option<Txid>,
+    /// Repeat the version 4 batch-set digest before signing a wallet reset.
+    #[arg(long)]
+    confirm_batch_plan_digest: Option<String>,
     /// Immutable unsigned plan created by `--dry-run`. Required before signing.
     #[arg(long)]
     approved_plan: Option<PathBuf>,
@@ -173,24 +180,30 @@ struct PrepareArgs {
     /// Retain this many of the largest confirmed wallet outputs.
     #[arg(long, default_value_t = 2)]
     preserve_largest: usize,
-    /// Maximum inputs in this one transaction.
+    /// Maximum inputs in each transaction.
     #[arg(long, default_value_t = 500)]
     max_inputs: usize,
     /// Aim for outputs of this value; a final output drains the remainder.
     #[arg(long, default_value_t = 5_000_000)]
     target_output_sats: u64,
-    /// Maximum outputs. Bridge mode requires an explicit value of 1.
+    /// Maximum outputs per transaction. Bridge mode requires an explicit value of 1.
     #[arg(long, default_value_t = 100)]
     max_outputs: usize,
     /// Fee rate in sat/vB.
     #[arg(long, default_value_t = 3)]
     fee_rate_sat_vb: u64,
-    /// Hard cap on the final transaction fee.
+    /// Hard cap on a single transaction, or the aggregate wallet-reset batch-set fee.
     #[arg(long, default_value_t = 200_000)]
     max_fee_sats: u64,
+    /// Hard cap on each wallet-reset batch fee. The set is also capped by max_fee_sats.
+    #[arg(long, default_value_t = 200_000)]
+    max_fee_sats_per_batch: u64,
     /// Hard cap below Bitcoin's 400,000-WU standardness limit.
     #[arg(long, default_value_t = 200_000)]
     max_weight_wu: u64,
+    /// Exact serialized signer JSON request cap per transaction.
+    #[arg(long, default_value_t = DEFAULT_MAX_SIGNER_REQUEST_BYTES)]
+    max_signer_request_bytes: usize,
     /// Must confirm that wallet spenders are paused and prepared inputs are excluded.
     #[arg(long)]
     confirm_maintenance: Option<String>,
@@ -213,6 +226,12 @@ struct BroadcastArgs {
     /// Must equal `exclusive-maintenance-window-active`.
     #[arg(long)]
     confirm_safe_to_broadcast: String,
+    /// Version 4 global batch-set manifest. Required for a batched wallet reset.
+    #[arg(long)]
+    batch_manifest: Option<PathBuf>,
+    /// Repeat the exact version 4 batch-set plan digest.
+    #[arg(long)]
+    confirm_batch_plan_digest: Option<String>,
 }
 
 // Clap needs the marker type in scope for a parsed-but-unchecked address.
@@ -242,7 +261,7 @@ struct DescriptorIdentity {
     descriptor_sha256: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct MaintenanceArtifact {
     version: u32,
     created_at_unix: u64,
@@ -291,6 +310,16 @@ struct MaintenanceArtifact {
     conservative_weight_wu: u64,
     max_fee_sats: u64,
     max_weight_wu: u64,
+    #[serde(default)]
+    batch_plan_digest: Option<String>,
+    #[serde(default)]
+    batch_index: Option<usize>,
+    #[serde(default)]
+    batch_count: Option<usize>,
+    #[serde(default)]
+    signer_request_bytes: Option<usize>,
+    #[serde(default)]
+    max_signer_request_bytes: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -351,6 +380,117 @@ impl UnsignedPlanReport {
         commitment.remote_tip_height = 0;
         commitment
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct UnsignedBatchPlan {
+    batch_index: usize,
+    unsigned_txid: String,
+    input_total_sats: u64,
+    output_total_sats: u64,
+    fee_sats: u64,
+    planned_output_count: usize,
+    signer_request_bytes: usize,
+    conservative_weight_wu: u64,
+    inputs: Vec<InputRecord>,
+    outputs: Vec<OutputRecord>,
+    psbt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchSetPlan {
+    version: u32,
+    plan_digest: String,
+    snapshot_tip_height: u32,
+    remote_tip_height: u32,
+    known_utxo_sync_performed: bool,
+    revealed_script_sync_performed: bool,
+    maintenance_mode: MaintenanceMode,
+    source_descriptor_identity: DescriptorIdentity,
+    destination_descriptor_identity: DescriptorIdentity,
+    require_drain_all: bool,
+    eligible_input_count: usize,
+    excluded_eligible_input_count: usize,
+    preserved_input_count: usize,
+    planned_output_count: usize,
+    destination: String,
+    destination_keychain: String,
+    destination_index: u32,
+    xpub: String,
+    master_fingerprint: String,
+    signer_network: String,
+    exclusion_count: usize,
+    exclusion_sha256: String,
+    total_input_sats: u64,
+    total_output_sats: u64,
+    total_fee_sats: u64,
+    requested_fee_rate_sat_vb: u64,
+    max_inputs_per_batch: usize,
+    max_outputs_per_batch: usize,
+    max_total_fee_sats: u64,
+    max_fee_sats_per_batch: u64,
+    max_weight_wu_per_batch: u64,
+    max_signer_request_bytes: usize,
+    unsigned_txids: Vec<String>,
+    batches: Vec<UnsignedBatchPlan>,
+}
+
+impl BatchSetPlan {
+    fn signing_commitment(&self) -> Self {
+        let mut commitment = self.clone();
+        commitment.plan_digest.clear();
+        commitment.snapshot_tip_height = 0;
+        commitment.remote_tip_height = 0;
+        commitment
+    }
+
+    fn computed_digest(&self) -> Result<String> {
+        Ok(sha256::Hash::hash(&serde_json::to_vec(&self.signing_commitment())?).to_string())
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.plan_digest = self.computed_digest()?;
+        Ok(self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BatchSetStatus {
+    Signing,
+    PartiallySigned,
+    FullySigned,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SignedBatchRecord {
+    batch_index: usize,
+    txid: String,
+    artifact_file: String,
+    artifact_sha256: String,
+    materialized: bool,
+    artifact: MaintenanceArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct BatchSetManifest {
+    version: u32,
+    plan_digest: String,
+    status: BatchSetStatus,
+    reserved_input_count: usize,
+    reserved_inputs_sha256: String,
+    plan: BatchSetPlan,
+    signed_artifacts: Vec<SignedBatchRecord>,
+    #[serde(default)]
+    last_error: Option<String>,
+}
+
+#[derive(Debug)]
+struct BuiltResetBatch {
+    input_range: Range<usize>,
+    psbt: Psbt,
+    signer_request_bytes: usize,
+    conservative_weight_wu: u64,
 }
 
 type ProviderWallet = PersistedWallet<Store>;
@@ -894,7 +1034,7 @@ fn read_artifacts(dir: &Path) -> Result<Vec<MaintenanceArtifact>> {
         let artifact: MaintenanceArtifact = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("reading prior artifact {}", path.display()))?;
         ensure!(
-            (LEGACY_ARTIFACT_VERSION..=ARTIFACT_VERSION).contains(&artifact.version),
+            (LEGACY_ARTIFACT_VERSION..=BATCH_SET_VERSION).contains(&artifact.version),
             "unsupported prior artifact version"
         );
         artifacts.push(artifact);
@@ -963,10 +1103,25 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
             args.confirm_maintenance.as_deref() == Some(PREPARE_CONFIRMATION),
             "maintenance acknowledgement must be `{PREPARE_CONFIRMATION}`"
         );
-        ensure!(
-            args.confirm_plan_txid.is_some(),
-            "confirm_plan_txid is required before signing"
-        );
+        if args.mode == MaintenanceMode::WalletReset {
+            ensure!(
+                args.confirm_batch_plan_digest.is_some(),
+                "confirm_batch_plan_digest is required before signing a wallet-reset batch set"
+            );
+            ensure!(
+                args.confirm_plan_txid.is_none(),
+                "confirm_plan_txid is not valid for a wallet-reset batch set"
+            );
+        } else {
+            ensure!(
+                args.confirm_plan_txid.is_some(),
+                "confirm_plan_txid is required before signing"
+            );
+            ensure!(
+                args.confirm_batch_plan_digest.is_none(),
+                "confirm_batch_plan_digest is valid only for a wallet-reset batch set"
+            );
+        }
         ensure!(
             args.approved_plan.is_some(),
             "approved_plan is required before signing"
@@ -1021,8 +1176,16 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
                     .reset_output_count
                     .context("reset_output_count is required in wallet-reset mode")?;
                 ensure!(
-                    (1..=args.max_outputs).contains(&reset_output_count),
-                    "reset_output_count must be between 1 and max_outputs"
+                    reset_output_count > 0,
+                    "reset_output_count must be positive"
+                );
+                ensure!(
+                    reset_output_count
+                        <= args
+                            .max_outputs
+                            .checked_mul(args.max_inputs)
+                            .context("reset output capacity overflow")?,
+                    "reset_output_count cannot fit within the per-batch output cap"
                 );
             } else {
                 ensure!(
@@ -1037,6 +1200,10 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         "max_weight_wu exceeds the Bitcoin standardness limit"
     );
     ensure!(
+        (1..=ABSOLUTE_MAX_SIGNER_REQUEST_BYTES).contains(&args.max_signer_request_bytes),
+        "max_signer_request_bytes must be between 1 and the original signer's 1 MiB request limit"
+    );
+    ensure!(
         args.signer_network == "mutinynet",
         "only the Mutinynet signer is supported"
     );
@@ -1045,10 +1212,12 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     let mut permissions = fs::metadata(&args.artifact_dir)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&args.artifact_dir, permissions)?;
-    if args.mode == MaintenanceMode::Bridge {
+    if args.mode == MaintenanceMode::Bridge
+        || (args.mode == MaintenanceMode::WalletReset && args.dry_run)
+    {
         ensure!(
             fs::read_dir(&args.artifact_dir)?.next().is_none(),
-            "bridge mode requires a completely empty artifact directory"
+            "a new full-drain plan requires a completely empty artifact directory"
         );
     }
 
@@ -1089,16 +1258,17 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     );
 
     let prior_artifacts = read_artifacts(&args.artifact_dir)?;
-    if matches!(
-        args.mode,
-        MaintenanceMode::WalletReset | MaintenanceMode::Bridge
-    ) {
+    if args.mode == MaintenanceMode::Bridge
+        || (args.mode == MaintenanceMode::WalletReset && args.dry_run)
+    {
         ensure!(
             prior_artifacts.is_empty(),
-            "full-drain modes require an empty artifact directory and one exact transaction"
+            "a new full-drain plan requires an empty artifact directory"
         );
     }
-    require_prior_artifacts_confirmed(&client, &prior_artifacts).await?;
+    if args.mode != MaintenanceMode::WalletReset {
+        require_prior_artifacts_confirmed(&client, &prior_artifacts).await?;
+    }
     let mandatory_excluded = load_exclusions(&args.exclude_outpoints)?;
     if args.mode == MaintenanceMode::Bridge {
         ensure!(
@@ -1109,13 +1279,15 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     let exclusion_count = mandatory_excluded.len();
     let exclusion_sha256 = exclusion_digest(&mandatory_excluded);
     let mut excluded = mandatory_excluded.clone();
-    for artifact in &prior_artifacts {
-        for input in &artifact.inputs {
-            excluded.insert(OutPoint::from_str(&input.outpoint)?);
-        }
-        let txid = Txid::from_str(&artifact.txid)?;
-        for vout in 0..artifact.outputs.len() {
-            excluded.insert(OutPoint::new(txid, u32::try_from(vout)?));
+    if args.mode == MaintenanceMode::Consolidate {
+        for artifact in &prior_artifacts {
+            for input in &artifact.inputs {
+                excluded.insert(OutPoint::from_str(&input.outpoint)?);
+            }
+            let txid = Txid::from_str(&artifact.txid)?;
+            for vout in 0..artifact.outputs.len() {
+                excluded.insert(OutPoint::new(txid, u32::try_from(vout)?));
+            }
         }
     }
 
@@ -1171,12 +1343,14 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
                 !selected.is_empty(),
                 "full-drain mode has no confirmed source outputs"
             );
-            ensure!(
-                selected.len() <= args.max_inputs,
-                "full-drain mode needs {} inputs, which exceeds max_inputs {}; refuse a partial drain",
-                selected.len(),
-                args.max_inputs
-            );
+            if args.mode == MaintenanceMode::Bridge {
+                ensure!(
+                    selected.len() <= args.max_inputs,
+                    "bridge mode needs {} inputs, which exceeds max_inputs {}; refuse a partial drain",
+                    selected.len(),
+                    args.max_inputs
+                );
+            }
             let selected_outpoints = selected
                 .iter()
                 .map(|output| output.outpoint)
@@ -1212,6 +1386,28 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         selected_total > args.max_fee_sats.saturating_add(1_000),
         "selected inputs cannot cover the fee cap and a non-dust output"
     );
+    if args.mode == MaintenanceMode::WalletReset {
+        return prepare_wallet_reset_batch_set(
+            &args,
+            &mut wallet,
+            &client,
+            snapshot_tip,
+            remote_tip,
+            source_identity,
+            destination_identity.context("wallet reset has no destination identity")?,
+            destination,
+            destination_keychain,
+            destination_index,
+            destination_script,
+            eligible_input_count,
+            excluded_eligible_input_count,
+            preserved_input_count,
+            exclusion_count,
+            exclusion_sha256,
+            selected,
+        )
+        .await;
+    }
     let available_after_fee_cap = selected_total - args.max_fee_sats;
     let (desired_outputs, fixed_output_sats) = match args.mode {
         MaintenanceMode::Consolidate => (
@@ -1220,18 +1416,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
                 .clamp(1, args.max_outputs),
             args.target_output_sats,
         ),
-        MaintenanceMode::WalletReset => {
-            let desired_outputs = args
-                .reset_output_count
-                .context("missing reset_output_count")?;
-            let fixed_output_sats = available_after_fee_cap
-                / u64::try_from(desired_outputs).context("invalid reset output count")?;
-            ensure!(
-                fixed_output_sats >= 1_000,
-                "wallet reset cannot create the requested output count above the minimum value"
-            );
-            (desired_outputs, fixed_output_sats)
-        }
+        MaintenanceMode::WalletReset => unreachable!("wallet reset uses a batch-set plan"),
         MaintenanceMode::Bridge => (1, available_after_fee_cap),
     };
 
@@ -1366,6 +1551,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         args.signer_auth_key
             .as_deref()
             .context("missing signer_auth_key")?,
+        args.max_signer_request_bytes,
     )
     .await?;
     verify_signed_transaction(&psbt, &signed_tx, &selected)?;
@@ -1441,6 +1627,11 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         conservative_weight_wu,
         max_fee_sats: args.max_fee_sats,
         max_weight_wu: args.max_weight_wu,
+        batch_plan_digest: None,
+        batch_index: None,
+        batch_count: None,
+        signer_request_bytes: None,
+        max_signer_request_bytes: None,
     };
     let artifact_path = args.artifact_dir.join(format!(
         "batch-{:03}-{txid}.json",
@@ -1449,6 +1640,1130 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     write_create_only(&artifact_path, &serde_json::to_vec_pretty(&artifact)?)?;
     println!("{}", serde_json::to_string_pretty(&artifact)?);
     eprintln!("artifact: {}", artifact_path.display());
+    Ok(())
+}
+
+fn build_reset_psbt_with_fixed_outputs(
+    wallet: &mut ProviderWallet,
+    selected: &[LocalOutput],
+    destination_script: &ScriptBuf,
+    output_count: usize,
+    fixed_output_sats: u64,
+    fee_rate_sat_vb: u64,
+) -> Result<Psbt> {
+    ensure!(!selected.is_empty(), "wallet-reset batch has no inputs");
+    ensure!(output_count > 0, "wallet-reset batch has no outputs");
+    let selected_outpoints = selected
+        .iter()
+        .map(|output| output.outpoint)
+        .collect::<Vec<_>>();
+    let mut builder = wallet.build_tx();
+    builder
+        .ordering(TxOrdering::Untouched)
+        .nlocktime(LockTime::ZERO)
+        .add_utxos(&selected_outpoints)?
+        .manually_selected_only()
+        .drain_to(destination_script.clone())
+        .fee_rate(FeeRate::from_sat_per_vb(fee_rate_sat_vb).context("invalid fee rate")?);
+    for _ in 1..output_count {
+        builder.add_recipient(
+            destination_script.clone(),
+            Amount::from_sat(fixed_output_sats),
+        );
+    }
+    let psbt = builder
+        .finish()
+        .context("building wallet-reset batch PSBT")?;
+    ensure!(
+        psbt.unsigned_tx.input.len() == selected.len(),
+        "BDK changed the exact wallet-reset batch input set"
+    );
+    ensure!(
+        psbt.unsigned_tx.output.len() == output_count,
+        "BDK changed the exact wallet-reset batch output count"
+    );
+    ensure!(
+        psbt.unsigned_tx
+            .output
+            .iter()
+            .all(|output| output.script_pubkey == *destination_script),
+        "wallet-reset batch contains an unexpected destination"
+    );
+    Ok(psbt)
+}
+
+fn build_reset_psbt(
+    wallet: &mut ProviderWallet,
+    selected: &[LocalOutput],
+    destination_script: &ScriptBuf,
+    output_count: usize,
+    fee_rate_sat_vb: u64,
+) -> Result<Psbt> {
+    let selected_total = selected.iter().try_fold(0_u64, |sum, output| {
+        sum.checked_add(output.txout.value.to_sat())
+            .context("wallet-reset batch input value overflow")
+    })?;
+    let provisional = build_reset_psbt_with_fixed_outputs(
+        wallet,
+        selected,
+        destination_script,
+        output_count,
+        1_000,
+        fee_rate_sat_vb,
+    )?;
+    let fee_sats = provisional.fee()?.to_sat();
+    let distributable = selected_total
+        .checked_sub(fee_sats)
+        .context("wallet-reset batch cannot pay its fee")?;
+    let fixed_output_sats = distributable
+        .checked_div(u64::try_from(output_count).context("invalid output count")?)
+        .context("wallet-reset batch has zero outputs")?;
+    ensure!(
+        fixed_output_sats >= 1_000,
+        "wallet-reset batch cannot fund {output_count} outputs of at least 1000 sats"
+    );
+    let psbt = build_reset_psbt_with_fixed_outputs(
+        wallet,
+        selected,
+        destination_script,
+        output_count,
+        fixed_output_sats,
+        fee_rate_sat_vb,
+    )?;
+    ensure!(
+        psbt.fee()?.to_sat() == fee_sats,
+        "wallet-reset batch fee changed while distributing outputs"
+    );
+    Ok(psbt)
+}
+
+fn batch_fits_caps(
+    psbt: &Psbt,
+    signer_network: &str,
+    max_fee_sats: u64,
+    max_weight_wu: u64,
+    max_signer_request_bytes: usize,
+) -> Result<Option<(usize, u64)>> {
+    let signer_request_bytes = signer_request_body(psbt, signer_network)?.len();
+    let conservative_weight_wu = conservative_signed_p2wpkh_weight(&psbt.unsigned_tx);
+    let fee_sats = psbt.fee()?.to_sat();
+    if signer_request_bytes > max_signer_request_bytes
+        || conservative_weight_wu > max_weight_wu
+        || conservative_weight_wu > MAX_STANDARD_WEIGHT_WU
+        || fee_sats > max_fee_sats
+    {
+        return Ok(None);
+    }
+    Ok(Some((signer_request_bytes, conservative_weight_wu)))
+}
+
+fn distribute_reset_outputs(
+    total: usize,
+    batches: usize,
+    per_batch_max: usize,
+) -> Result<Vec<usize>> {
+    ensure!(batches > 0, "wallet-reset batch count must be positive");
+    ensure!(
+        total >= batches,
+        "wallet reset needs at least one destination output per batch"
+    );
+    let base = total / batches;
+    let remainder = total % batches;
+    let counts = (0..batches)
+        .map(|index| base + usize::from(index < remainder))
+        .collect::<Vec<_>>();
+    ensure!(
+        counts
+            .iter()
+            .all(|count| (1..=per_batch_max).contains(count)),
+        "wallet-reset output count does not fit the per-batch output cap"
+    );
+    ensure!(
+        counts.iter().sum::<usize>() == total,
+        "wallet-reset output distribution changed the exact total"
+    );
+    Ok(counts)
+}
+
+fn distribute_reset_outputs_by_value(
+    total: usize,
+    batch_values: &[u64],
+    per_batch_max: usize,
+) -> Result<Vec<usize>> {
+    ensure!(!batch_values.is_empty(), "wallet reset has no batches");
+    ensure!(
+        total >= batch_values.len(),
+        "wallet reset needs at least one destination output per batch"
+    );
+    ensure!(
+        total
+            <= batch_values
+                .len()
+                .checked_mul(per_batch_max)
+                .context("output capacity overflow")?,
+        "wallet reset exceeds aggregate per-batch output capacity"
+    );
+    let total_value = batch_values.iter().try_fold(0_u128, |sum, value| {
+        sum.checked_add(u128::from(*value))
+            .context("batch value overflow")
+    })?;
+    ensure!(total_value > 0, "wallet reset has no input value");
+    let mut counts = vec![1_usize; batch_values.len()];
+    let distributable = total - counts.len();
+    let mut assigned = 0_usize;
+    let mut remainders = Vec::with_capacity(batch_values.len());
+    for (index, value) in batch_values.iter().enumerate() {
+        let numerator = u128::try_from(distributable)? * u128::from(*value);
+        let quota = usize::try_from(numerator / total_value)?;
+        let allocation = quota.min(per_batch_max - 1);
+        counts[index] += allocation;
+        assigned += allocation;
+        remainders.push((numerator % total_value, *value, index));
+    }
+    let mut remaining = distributable - assigned;
+    remainders.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| right.1.cmp(&left.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    while remaining > 0 {
+        let mut progressed = false;
+        for (_, _, index) in &remainders {
+            if counts[*index] == per_batch_max {
+                continue;
+            }
+            counts[*index] += 1;
+            remaining -= 1;
+            progressed = true;
+            if remaining == 0 {
+                break;
+            }
+        }
+        ensure!(progressed, "wallet-reset output capacity was exhausted");
+    }
+    ensure!(
+        counts.iter().sum::<usize>() == total
+            && counts
+                .iter()
+                .all(|count| (1..=per_batch_max).contains(count)),
+        "value-proportional output distribution changed the exact total"
+    );
+    Ok(counts)
+}
+
+fn build_reset_batches(
+    wallet: &mut ProviderWallet,
+    selected: &mut Vec<LocalOutput>,
+    destination_script: &ScriptBuf,
+    total_output_count: usize,
+    args: &PrepareArgs,
+) -> Result<Vec<BuiltResetBatch>> {
+    let mut sized = Vec::with_capacity(selected.len());
+    for output in selected.drain(..) {
+        let psbt = build_reset_psbt(
+            wallet,
+            std::slice::from_ref(&output),
+            destination_script,
+            1,
+            args.fee_rate_sat_vb,
+        )?;
+        let signer_request_bytes = signer_request_body(&psbt, &args.signer_network)?.len();
+        let conservative_weight_wu = conservative_signed_p2wpkh_weight(&psbt.unsigned_tx);
+        let fee_sats = psbt.fee()?.to_sat();
+        ensure!(
+            signer_request_bytes <= args.max_signer_request_bytes,
+            "outpoint {} alone needs a {}-byte signer request, exceeding the {}-byte cap",
+            output.outpoint,
+            signer_request_bytes,
+            args.max_signer_request_bytes
+        );
+        ensure!(
+            conservative_weight_wu <= args.max_weight_wu
+                && conservative_weight_wu <= MAX_STANDARD_WEIGHT_WU,
+            "outpoint {} alone exceeds a signed-weight cap",
+            output.outpoint
+        );
+        ensure!(
+            fee_sats <= args.max_fee_sats_per_batch,
+            "outpoint {} alone exceeds the per-batch fee cap",
+            output.outpoint
+        );
+        sized.push((signer_request_bytes, output));
+    }
+    sized.sort_by(|(left_size, left), (right_size, right)| {
+        right_size
+            .cmp(left_size)
+            .then_with(|| left.outpoint.cmp(&right.outpoint))
+    });
+    selected.extend(sized.into_iter().map(|(_, output)| output));
+
+    let input_count = selected.len();
+    let minimum_batches = input_count
+        .div_ceil(args.max_inputs)
+        .max(total_output_count.div_ceil(args.max_outputs));
+    let maximum_batches = input_count.min(total_output_count);
+    ensure!(
+        minimum_batches <= maximum_batches,
+        "wallet reset cannot satisfy both the input and output caps"
+    );
+
+    for target_batches in minimum_batches..=maximum_batches {
+        let output_counts =
+            distribute_reset_outputs(total_output_count, target_batches, args.max_outputs)?;
+        let mut start = 0_usize;
+        let mut batches = Vec::with_capacity(target_batches);
+        let mut target_is_feasible = true;
+        for (batch_index, output_count) in output_counts.into_iter().enumerate() {
+            let batches_after = target_batches - batch_index - 1;
+            let max_end = (start + args.max_inputs).min(input_count - batches_after);
+            let mut best = None;
+            for end in (start + 1)..=max_end {
+                let psbt = match build_reset_psbt(
+                    wallet,
+                    &selected[start..end],
+                    destination_script,
+                    output_count,
+                    args.fee_rate_sat_vb,
+                ) {
+                    Ok(psbt) => psbt,
+                    Err(_) => continue,
+                };
+                let Some((signer_request_bytes, conservative_weight_wu)) = batch_fits_caps(
+                    &psbt,
+                    &args.signer_network,
+                    args.max_fee_sats_per_batch,
+                    args.max_weight_wu,
+                    args.max_signer_request_bytes,
+                )?
+                else {
+                    break;
+                };
+                best = Some(BuiltResetBatch {
+                    input_range: start..end,
+                    psbt,
+                    signer_request_bytes,
+                    conservative_weight_wu,
+                });
+            }
+            let Some(batch) = best else {
+                target_is_feasible = false;
+                break;
+            };
+            start = batch.input_range.end;
+            batches.push(batch);
+        }
+        if target_is_feasible && start == input_count {
+            let batch_values = batches
+                .iter()
+                .map(|batch| {
+                    selected[batch.input_range.clone()]
+                        .iter()
+                        .try_fold(0_u64, |sum, output| {
+                            sum.checked_add(output.txout.value.to_sat())
+                                .context("wallet-reset batch value overflow")
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let proportional_counts = distribute_reset_outputs_by_value(
+                total_output_count,
+                &batch_values,
+                args.max_outputs,
+            )?;
+            let mut rebuilt = Vec::with_capacity(batches.len());
+            let mut proportional_is_feasible = true;
+            for (batch, output_count) in batches.into_iter().zip(proportional_counts) {
+                let psbt = match build_reset_psbt(
+                    wallet,
+                    &selected[batch.input_range.clone()],
+                    destination_script,
+                    output_count,
+                    args.fee_rate_sat_vb,
+                ) {
+                    Ok(psbt) => psbt,
+                    Err(_) => {
+                        proportional_is_feasible = false;
+                        break;
+                    }
+                };
+                let Some((signer_request_bytes, conservative_weight_wu)) = batch_fits_caps(
+                    &psbt,
+                    &args.signer_network,
+                    args.max_fee_sats_per_batch,
+                    args.max_weight_wu,
+                    args.max_signer_request_bytes,
+                )?
+                else {
+                    proportional_is_feasible = false;
+                    break;
+                };
+                rebuilt.push(BuiltResetBatch {
+                    input_range: batch.input_range,
+                    psbt,
+                    signer_request_bytes,
+                    conservative_weight_wu,
+                });
+            }
+            if proportional_is_feasible {
+                return Ok(rebuilt);
+            }
+        }
+    }
+    bail!(
+        "wallet-reset input set cannot fit the configured signer-request, input, output, fee, and weight caps"
+    )
+}
+
+fn checked_input_records_total(inputs: &[InputRecord]) -> Result<u64> {
+    inputs.iter().try_fold(0_u64, |sum, input| {
+        sum.checked_add(input.value_sats)
+            .context("input record value overflow")
+    })
+}
+
+fn checked_output_records_total(outputs: &[OutputRecord]) -> Result<u64> {
+    outputs.iter().try_fold(0_u64, |sum, output| {
+        sum.checked_add(output.value_sats)
+            .context("output record value overflow")
+    })
+}
+
+fn reserved_inputs_digest<'a>(outpoints: impl IntoIterator<Item = &'a str>) -> Result<String> {
+    let mut outpoints = outpoints
+        .into_iter()
+        .map(|value| OutPoint::from_str(value).map(|outpoint| outpoint.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    outpoints.sort_unstable();
+    ensure!(
+        outpoints.windows(2).all(|window| window[0] != window[1]),
+        "reserved input set contains a duplicate outpoint"
+    );
+    let canonical = if outpoints.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", outpoints.join("\n"))
+    };
+    Ok(sha256::Hash::hash(canonical.as_bytes()).to_string())
+}
+
+fn validate_batch_set_plan(plan: &BatchSetPlan) -> Result<()> {
+    ensure!(
+        plan.version == BATCH_SET_VERSION,
+        "unsupported batch-set plan version"
+    );
+    ensure!(
+        plan.plan_digest == plan.computed_digest()?,
+        "batch-set plan digest is inconsistent"
+    );
+    ensure!(
+        plan.maintenance_mode == MaintenanceMode::WalletReset
+            && plan.require_drain_all
+            && plan.known_utxo_sync_performed
+            && plan.revealed_script_sync_performed
+            && plan.preserved_input_count == 0,
+        "batch-set plan is not an exhaustive zero-reserve wallet reset"
+    );
+    validate_descriptor_identity(&plan.source_descriptor_identity, false)?;
+    validate_descriptor_identity(&plan.destination_descriptor_identity, true)?;
+    ensure!(
+        plan.source_descriptor_identity.descriptor_sha256
+            != plan.destination_descriptor_identity.descriptor_sha256,
+        "batch-set source and destination descriptors are identical"
+    );
+    ensure!(
+        plan.xpub == plan.source_descriptor_identity.account_xpub
+            && plan.master_fingerprint == plan.source_descriptor_identity.master_fingerprint,
+        "batch-set source identity fields are inconsistent"
+    );
+    ensure!(
+        plan.destination_keychain == "internal",
+        "batch-set destination is not on the fresh internal keychain"
+    );
+    ensure!(
+        plan.signer_network == "mutinynet"
+            && plan.requested_fee_rate_sat_vb > 0
+            && plan.max_inputs_per_batch > 0
+            && plan.max_outputs_per_batch > 0
+            && plan.max_total_fee_sats > 0
+            && plan.max_fee_sats_per_batch > 0
+            && plan.max_weight_wu_per_batch > 0
+            && plan.max_weight_wu_per_batch <= MAX_STANDARD_WEIGHT_WU,
+        "batch-set network or safety caps are invalid"
+    );
+    let destination = derive_bip84_destination(
+        &plan.destination_descriptor_identity,
+        KeychainKind::Internal,
+        plan.destination_index,
+        true,
+    )?;
+    ensure!(
+        destination.to_string() == plan.destination,
+        "batch-set destination does not match the fresh descriptor"
+    );
+    ensure!(
+        (1..=ABSOLUTE_MAX_SIGNER_REQUEST_BYTES).contains(&plan.max_signer_request_bytes),
+        "batch-set signer request cap exceeds the original signer limit"
+    );
+    ensure!(
+        plan.batches.len() == plan.unsigned_txids.len() && !plan.batches.is_empty(),
+        "batch-set transaction inventory is inconsistent"
+    );
+
+    let destination_script_hex = destination.script_pubkey().as_bytes().to_lower_hex_string();
+    let mut seen_inputs = HashSet::new();
+    let mut seen_txids = HashSet::new();
+    let mut total_inputs = 0_u64;
+    let mut total_outputs = 0_u64;
+    let mut total_fees = 0_u64;
+    let mut total_output_count = 0_usize;
+    for (offset, batch) in plan.batches.iter().enumerate() {
+        ensure!(
+            batch.batch_index == offset + 1,
+            "batch-set indices are not contiguous and one-based"
+        );
+        ensure!(
+            batch.inputs.len() <= plan.max_inputs_per_batch
+                && batch.outputs.len() <= plan.max_outputs_per_batch
+                && !batch.inputs.is_empty()
+                && !batch.outputs.is_empty(),
+            "batch {} violates an input or output count cap",
+            batch.batch_index
+        );
+        let psbt = Psbt::from_str(&batch.psbt)
+            .with_context(|| format!("batch {} contains an invalid PSBT", batch.batch_index))?;
+        let unsigned_txid = psbt.unsigned_tx.compute_txid().to_string();
+        ensure!(
+            unsigned_txid == batch.unsigned_txid
+                && plan.unsigned_txids[offset] == batch.unsigned_txid
+                && seen_txids.insert(unsigned_txid),
+            "batch {} txid inventory is inconsistent",
+            batch.batch_index
+        );
+        ensure!(
+            psbt.unsigned_tx.input.len() == batch.inputs.len()
+                && psbt.unsigned_tx.output.len() == batch.outputs.len()
+                && batch.planned_output_count == batch.outputs.len(),
+            "batch {} transaction counts are inconsistent",
+            batch.batch_index
+        );
+        for (input_index, (txin, record)) in
+            psbt.unsigned_tx.input.iter().zip(&batch.inputs).enumerate()
+        {
+            let outpoint = OutPoint::from_str(&record.outpoint)?;
+            let expected_prevout = TxOut {
+                value: Amount::from_sat(record.value_sats),
+                script_pubkey: ScriptBuf::from_hex(&record.script_pubkey_hex)?,
+            };
+            let psbt_input = &psbt.inputs[input_index];
+            let witness_utxo = psbt_input
+                .witness_utxo
+                .as_ref()
+                .context("batch PSBT input has no witness_utxo")?;
+            let parent = psbt_input
+                .non_witness_utxo
+                .as_ref()
+                .context("batch PSBT input has no non_witness_utxo")?;
+            let parent_output = parent
+                .output
+                .get(usize::try_from(outpoint.vout)?)
+                .context("batch PSBT parent has no referenced output")?;
+            ensure!(
+                txin.previous_output == outpoint
+                    && parent.compute_txid() == outpoint.txid
+                    && witness_utxo == &expected_prevout
+                    && parent_output == &expected_prevout
+                    && seen_inputs.insert(outpoint),
+                "batch-set input union is duplicated or inconsistent at {outpoint}"
+            );
+        }
+        for (txout, record) in psbt.unsigned_tx.output.iter().zip(&batch.outputs) {
+            ensure!(
+                txout.value.to_sat() == record.value_sats
+                    && txout.script_pubkey.as_bytes().to_lower_hex_string()
+                        == record.script_pubkey_hex
+                    && record.script_pubkey_hex == destination_script_hex,
+                "batch {} contains an inconsistent destination output",
+                batch.batch_index
+            );
+        }
+        let input_total = checked_input_records_total(&batch.inputs)?;
+        let output_total = checked_output_records_total(&batch.outputs)?;
+        let fee_sats = input_total
+            .checked_sub(output_total)
+            .context("batch outputs exceed its recorded inputs")?;
+        let request_bytes = signer_request_body(&psbt, &plan.signer_network)?.len();
+        let conservative_weight_wu = conservative_signed_p2wpkh_weight(&psbt.unsigned_tx);
+        ensure!(
+            input_total == batch.input_total_sats
+                && output_total == batch.output_total_sats
+                && fee_sats == batch.fee_sats
+                && fee_sats <= plan.max_fee_sats_per_batch
+                && request_bytes == batch.signer_request_bytes
+                && request_bytes <= plan.max_signer_request_bytes
+                && conservative_weight_wu == batch.conservative_weight_wu
+                && conservative_weight_wu <= plan.max_weight_wu_per_batch
+                && conservative_weight_wu <= MAX_STANDARD_WEIGHT_WU,
+            "batch {} totals or safety bounds are inconsistent",
+            batch.batch_index
+        );
+        total_inputs = total_inputs
+            .checked_add(input_total)
+            .context("set input overflow")?;
+        total_outputs = total_outputs
+            .checked_add(output_total)
+            .context("set output overflow")?;
+        total_fees = total_fees
+            .checked_add(fee_sats)
+            .context("set fee overflow")?;
+        total_output_count = total_output_count
+            .checked_add(batch.outputs.len())
+            .context("set output count overflow")?;
+    }
+    let accounted_inputs = seen_inputs
+        .len()
+        .checked_add(plan.excluded_eligible_input_count)
+        .context("batch-set input accounting overflow")?;
+    ensure!(
+        accounted_inputs == plan.eligible_input_count,
+        "batch-set input union omits or adds eligible source outpoints"
+    );
+    ensure!(
+        total_inputs == plan.total_input_sats
+            && total_outputs == plan.total_output_sats
+            && total_fees == plan.total_fee_sats
+            && total_fees <= plan.max_total_fee_sats
+            && total_output_count == plan.planned_output_count,
+        "batch-set aggregate totals are inconsistent"
+    );
+    Ok(())
+}
+
+fn batch_artifact_file(batch: &UnsignedBatchPlan) -> String {
+    format!(
+        "batch-{:03}-{}.json",
+        batch.batch_index, batch.unsigned_txid
+    )
+}
+
+fn batch_manifest_path(artifact_dir: &Path, plan_digest: &str) -> PathBuf {
+    artifact_dir.join(format!("batch-set-{plan_digest}.manifest.json"))
+}
+
+fn maintenance_artifact_digest(artifact: &MaintenanceArtifact) -> Result<String> {
+    Ok(sha256::Hash::hash(&serde_json::to_vec(artifact)?).to_string())
+}
+
+fn persist_batch_manifest(path: &Path, manifest: &BatchSetManifest, create: bool) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    if create {
+        write_create_only(path, &bytes)
+    } else {
+        write_replace_private(path, &bytes)
+    }
+}
+
+fn materialize_signed_records(
+    artifact_dir: &Path,
+    manifest: &mut BatchSetManifest,
+) -> Result<bool> {
+    let mut changed = false;
+    for record in &mut manifest.signed_artifacts {
+        changed |= materialize_signed_record(artifact_dir, record)?;
+    }
+    Ok(changed)
+}
+
+fn materialize_signed_record(artifact_dir: &Path, record: &mut SignedBatchRecord) -> Result<bool> {
+    let path = artifact_dir.join(&record.artifact_file);
+    let expected_digest = maintenance_artifact_digest(&record.artifact)?;
+    ensure!(
+        expected_digest == record.artifact_sha256,
+        "signed batch {} has an inconsistent embedded artifact digest",
+        record.batch_index
+    );
+    if path.exists() {
+        let on_disk: MaintenanceArtifact = serde_json::from_slice(&fs::read(&path)?)?;
+        ensure!(
+            on_disk == record.artifact,
+            "signed batch {} artifact file differs from the reserved manifest artifact",
+            record.batch_index
+        );
+    } else {
+        write_create_only(&path, &serde_json::to_vec_pretty(&record.artifact)?)?;
+    }
+    let changed = !record.materialized;
+    record.materialized = true;
+    Ok(changed)
+}
+
+fn validate_signed_manifest_records(manifest: &BatchSetManifest) -> Result<()> {
+    ensure!(
+        manifest.signed_artifacts.len() <= manifest.plan.batches.len(),
+        "batch manifest has more signed records than planned batches"
+    );
+    let mut seen = HashSet::new();
+    for record in &manifest.signed_artifacts {
+        ensure!(
+            seen.insert(record.batch_index),
+            "batch manifest contains duplicate signed batch {}",
+            record.batch_index
+        );
+        let batch = manifest
+            .plan
+            .batches
+            .get(record.batch_index.saturating_sub(1))
+            .context("signed batch record index is out of range")?;
+        ensure!(
+            batch.batch_index == record.batch_index
+                && record.txid == batch.unsigned_txid
+                && record.artifact_file == batch_artifact_file(batch)
+                && record.artifact_sha256 == maintenance_artifact_digest(&record.artifact)?,
+            "signed batch {} record differs from its plan",
+            record.batch_index
+        );
+        validate_batch_artifact_against_plan(&record.artifact, &manifest.plan, batch)?;
+    }
+    match manifest.status {
+        BatchSetStatus::Signing => {
+            ensure!(
+                manifest.signed_artifacts.is_empty(),
+                "signing manifest already contains signed artifacts"
+            );
+        }
+        BatchSetStatus::PartiallySigned => {
+            ensure!(
+                !manifest.signed_artifacts.is_empty()
+                    && manifest.signed_artifacts.len() < manifest.plan.batches.len(),
+                "partially-signed manifest has an invalid signed artifact count"
+            );
+        }
+        BatchSetStatus::FullySigned => {
+            ensure!(
+                manifest.signed_artifacts.len() == manifest.plan.batches.len(),
+                "fully-signed manifest does not contain every planned artifact"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn initialize_or_resume_batch_manifest(
+    artifact_dir: &Path,
+    plan: &BatchSetPlan,
+) -> Result<(PathBuf, BatchSetManifest)> {
+    let path = batch_manifest_path(artifact_dir, &plan.plan_digest);
+    let reserved_input_count = plan.batches.iter().map(|batch| batch.inputs.len()).sum();
+    let reserved_inputs_sha256 = reserved_inputs_digest(
+        plan.batches
+            .iter()
+            .flat_map(|batch| batch.inputs.iter().map(|input| input.outpoint.as_str())),
+    )?;
+    let manifest_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("batch manifest has no valid filename")?
+        .to_owned();
+    let mut allowed_names = plan
+        .batches
+        .iter()
+        .map(batch_artifact_file)
+        .collect::<HashSet<_>>();
+    allowed_names.insert(manifest_name);
+    if path.exists() {
+        for entry in fs::read_dir(artifact_dir)? {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("artifact directory contains a non-UTF-8 name"))?;
+            ensure!(
+                allowed_names.contains(&name),
+                "artifact directory contains stale or foreign batch-set state: {name}"
+            );
+        }
+        let mut manifest: BatchSetManifest = serde_json::from_slice(&fs::read(&path)?)?;
+        ensure!(
+            manifest.version == BATCH_SET_VERSION
+                && manifest.plan_digest == plan.plan_digest
+                && manifest.plan == *plan
+                && manifest.reserved_input_count == reserved_input_count
+                && manifest.reserved_inputs_sha256 == reserved_inputs_sha256,
+            "existing batch-set manifest does not reserve this exact approved plan"
+        );
+        validate_signed_manifest_records(&manifest)?;
+        if materialize_signed_records(artifact_dir, &mut manifest)? {
+            persist_batch_manifest(&path, &manifest, false)?;
+        }
+        return Ok((path, manifest));
+    }
+
+    ensure!(
+        fs::read_dir(artifact_dir)?.next().is_none(),
+        "a new wallet-reset signing run requires an empty artifact directory"
+    );
+    for batch in &plan.batches {
+        ensure!(
+            !artifact_dir.join(batch_artifact_file(batch)).exists(),
+            "wallet-reset artifact exists without its exact global manifest"
+        );
+    }
+    let manifest = BatchSetManifest {
+        version: BATCH_SET_VERSION,
+        plan_digest: plan.plan_digest.clone(),
+        status: BatchSetStatus::Signing,
+        reserved_input_count,
+        reserved_inputs_sha256,
+        plan: plan.clone(),
+        signed_artifacts: Vec::new(),
+        last_error: None,
+    };
+    persist_batch_manifest(&path, &manifest, true)?;
+    Ok((path, manifest))
+}
+
+fn artifact_for_signed_batch(
+    plan: &BatchSetPlan,
+    batch: &UnsignedBatchPlan,
+    signed_tx: &Transaction,
+    snapshot_tip_hash: String,
+) -> Result<MaintenanceArtifact> {
+    let psbt = Psbt::from_str(&batch.psbt)?;
+    let prevouts = input_records_prevouts(&batch.inputs)?;
+    verify_signed_transaction_with_prevouts(&psbt, signed_tx, prevouts.clone())?;
+    let fee_sats = transaction_fee_with_prevouts(signed_tx, &prevouts)?;
+    ensure!(fee_sats == batch.fee_sats, "signed batch fee changed");
+    let weight_wu = signed_tx.weight().to_wu();
+    ensure!(
+        weight_wu <= batch.conservative_weight_wu
+            && weight_wu <= plan.max_weight_wu_per_batch
+            && weight_wu <= MAX_STANDARD_WEIGHT_WU,
+        "signed batch exceeds a weight cap"
+    );
+    let destination_script = Address::<NetworkUnchecked>::from_str(&plan.destination)?
+        .require_network(Network::Signet)?
+        .script_pubkey();
+    Ok(MaintenanceArtifact {
+        version: BATCH_SET_VERSION,
+        created_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        snapshot_tip_height: plan.snapshot_tip_height,
+        snapshot_tip_hash,
+        remote_tip_height: plan.remote_tip_height,
+        known_utxo_sync_performed: plan.known_utxo_sync_performed,
+        revealed_script_sync_performed: plan.revealed_script_sync_performed,
+        bridge_control_verified: false,
+        maintenance_mode: MaintenanceMode::WalletReset,
+        source_descriptor_identity: Some(plan.source_descriptor_identity.clone()),
+        destination_descriptor_identity: Some(plan.destination_descriptor_identity.clone()),
+        require_drain_all: true,
+        eligible_input_count: plan.eligible_input_count,
+        excluded_eligible_input_count: plan.excluded_eligible_input_count,
+        preserved_input_count: 0,
+        planned_output_count: batch.outputs.len(),
+        xpub: plan.xpub.clone(),
+        master_fingerprint: plan.master_fingerprint.clone(),
+        signer_network: plan.signer_network.clone(),
+        destination: plan.destination.clone(),
+        destination_script_hex: destination_script.as_bytes().to_lower_hex_string(),
+        destination_keychain: plan.destination_keychain.clone(),
+        destination_index: plan.destination_index,
+        exclusion_count: plan.exclusion_count,
+        exclusion_sha256: plan.exclusion_sha256.clone(),
+        inputs: batch.inputs.clone(),
+        outputs: batch.outputs.clone(),
+        psbt: batch.psbt.clone(),
+        signed_tx_hex: serialize(signed_tx).to_lower_hex_string(),
+        txid: signed_tx.compute_txid().to_string(),
+        fee_sats,
+        fee_rate_sat_vb: fee_sats as f64 / signed_tx.vsize() as f64,
+        weight_wu,
+        conservative_weight_wu: batch.conservative_weight_wu,
+        max_fee_sats: plan.max_fee_sats_per_batch,
+        max_weight_wu: plan.max_weight_wu_per_batch,
+        batch_plan_digest: Some(plan.plan_digest.clone()),
+        batch_index: Some(batch.batch_index),
+        batch_count: Some(plan.batches.len()),
+        signer_request_bytes: Some(batch.signer_request_bytes),
+        max_signer_request_bytes: Some(plan.max_signer_request_bytes),
+    })
+}
+
+fn input_records_prevouts(inputs: &[InputRecord]) -> Result<HashMap<OutPoint, TxOut>> {
+    let mut prevouts = HashMap::new();
+    for input in inputs {
+        let outpoint = OutPoint::from_str(&input.outpoint)?;
+        ensure!(
+            prevouts
+                .insert(
+                    outpoint,
+                    TxOut {
+                        value: Amount::from_sat(input.value_sats),
+                        script_pubkey: ScriptBuf::from_hex(&input.script_pubkey_hex)?,
+                    },
+                )
+                .is_none(),
+            "input records contain duplicate outpoint {outpoint}"
+        );
+    }
+    Ok(prevouts)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_wallet_reset_batch_set(
+    args: &PrepareArgs,
+    wallet: &mut ProviderWallet,
+    client: &esplora_client::AsyncClient,
+    snapshot_tip: u32,
+    remote_tip: u32,
+    source_identity: DescriptorIdentity,
+    destination_identity: DescriptorIdentity,
+    destination: Address,
+    destination_keychain: String,
+    destination_index: u32,
+    destination_script: ScriptBuf,
+    eligible_input_count: usize,
+    excluded_eligible_input_count: usize,
+    preserved_input_count: usize,
+    exclusion_count: usize,
+    exclusion_sha256: String,
+    mut selected: Vec<LocalOutput>,
+) -> Result<()> {
+    let reset_output_count = args
+        .reset_output_count
+        .context("missing reset output count")?;
+    let eligible_outpoints = selected
+        .iter()
+        .map(|output| output.outpoint)
+        .collect::<Vec<_>>();
+    ensure!(
+        eligible_outpoints.len() + excluded_eligible_input_count == eligible_input_count,
+        "wallet-reset selected union does not account for every eligible outpoint"
+    );
+    let built_batches = build_reset_batches(
+        wallet,
+        &mut selected,
+        &destination_script,
+        reset_output_count,
+        args,
+    )?;
+    let mut batches = Vec::with_capacity(built_batches.len());
+    for (offset, built) in built_batches.iter().enumerate() {
+        let inputs = selected[built.input_range.clone()]
+            .iter()
+            .map(input_record)
+            .collect::<Result<Vec<_>>>()?;
+        let outputs = built
+            .psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .map(|output| OutputRecord {
+                value_sats: output.value.to_sat(),
+                script_pubkey_hex: output.script_pubkey.as_bytes().to_lower_hex_string(),
+            })
+            .collect::<Vec<_>>();
+        let input_total_sats = checked_input_records_total(&inputs)?;
+        let output_total_sats = checked_output_records_total(&outputs)?;
+        let fee_sats = input_total_sats
+            .checked_sub(output_total_sats)
+            .context("wallet-reset batch outputs exceed inputs")?;
+        batches.push(UnsignedBatchPlan {
+            batch_index: offset + 1,
+            unsigned_txid: built.psbt.unsigned_tx.compute_txid().to_string(),
+            input_total_sats,
+            output_total_sats,
+            fee_sats,
+            planned_output_count: outputs.len(),
+            signer_request_bytes: built.signer_request_bytes,
+            conservative_weight_wu: built.conservative_weight_wu,
+            inputs,
+            outputs,
+            psbt: built.psbt.to_string(),
+        });
+    }
+    let total_input_sats = batches.iter().try_fold(0_u64, |sum, batch| {
+        sum.checked_add(batch.input_total_sats)
+            .context("wallet-reset set input overflow")
+    })?;
+    let total_output_sats = batches.iter().try_fold(0_u64, |sum, batch| {
+        sum.checked_add(batch.output_total_sats)
+            .context("wallet-reset set output overflow")
+    })?;
+    let total_fee_sats = batches.iter().try_fold(0_u64, |sum, batch| {
+        sum.checked_add(batch.fee_sats)
+            .context("wallet-reset set fee overflow")
+    })?;
+    ensure!(
+        total_fee_sats <= args.max_fee_sats,
+        "wallet-reset batch set fee {total_fee_sats} exceeds the aggregate {}-sat cap",
+        args.max_fee_sats
+    );
+    let unsigned_txids = batches
+        .iter()
+        .map(|batch| batch.unsigned_txid.clone())
+        .collect::<Vec<_>>();
+    let plan = BatchSetPlan {
+        version: BATCH_SET_VERSION,
+        plan_digest: String::new(),
+        snapshot_tip_height: snapshot_tip,
+        remote_tip_height: remote_tip,
+        known_utxo_sync_performed: true,
+        revealed_script_sync_performed: true,
+        maintenance_mode: MaintenanceMode::WalletReset,
+        source_descriptor_identity: source_identity,
+        destination_descriptor_identity: destination_identity,
+        require_drain_all: true,
+        eligible_input_count,
+        excluded_eligible_input_count,
+        preserved_input_count,
+        planned_output_count: reset_output_count,
+        destination: destination.to_string(),
+        destination_keychain,
+        destination_index,
+        xpub: args.wallet.xpub.to_string(),
+        master_fingerprint: args.wallet.master_fingerprint.to_string(),
+        signer_network: args.signer_network.clone(),
+        exclusion_count,
+        exclusion_sha256,
+        total_input_sats,
+        total_output_sats,
+        total_fee_sats,
+        requested_fee_rate_sat_vb: args.fee_rate_sat_vb,
+        max_inputs_per_batch: args.max_inputs,
+        max_outputs_per_batch: args.max_outputs,
+        max_total_fee_sats: args.max_fee_sats,
+        max_fee_sats_per_batch: args.max_fee_sats_per_batch,
+        max_weight_wu_per_batch: args.max_weight_wu,
+        max_signer_request_bytes: args.max_signer_request_bytes,
+        unsigned_txids,
+        batches,
+    }
+    .seal()?;
+    validate_batch_set_plan(&plan)?;
+
+    if args.dry_run {
+        let bytes = serde_json::to_vec_pretty(&plan)?;
+        write_create_only(
+            args.plan_output.as_deref().context("missing plan output")?,
+            &bytes,
+        )?;
+        println!("{}", String::from_utf8(bytes)?);
+        return Ok(());
+    }
+
+    let approved_path = args
+        .approved_plan
+        .as_deref()
+        .context("missing approved plan")?;
+    let approved: BatchSetPlan = serde_json::from_slice(&fs::read(approved_path)?)?;
+    validate_batch_set_plan(&approved)?;
+    ensure!(
+        approved.signing_commitment() == plan.signing_commitment(),
+        "approved wallet-reset batch set does not match the exact rebuilt set"
+    );
+    ensure!(
+        args.confirm_batch_plan_digest.as_deref() == Some(approved.plan_digest.as_str()),
+        "confirmed batch-set digest does not match the approved plan"
+    );
+
+    let all_outpoints = plan
+        .batches
+        .iter()
+        .flat_map(|batch| batch.inputs.iter())
+        .map(|input| OutPoint::from_str(&input.outpoint))
+        .collect::<Result<Vec<_>, _>>()?;
+    check_unspent(client, &all_outpoints).await?;
+    let (manifest_path, mut manifest) =
+        initialize_or_resume_batch_manifest(&args.artifact_dir, &approved)?;
+    ensure!(
+        manifest.status != BatchSetStatus::FullySigned
+            || manifest.signed_artifacts.len() == approved.batches.len(),
+        "fully-signed manifest has an incomplete artifact inventory"
+    );
+
+    for batch in &approved.batches {
+        if manifest
+            .signed_artifacts
+            .iter()
+            .any(|record| record.batch_index == batch.batch_index)
+        {
+            continue;
+        }
+        let batch_outpoints = batch
+            .inputs
+            .iter()
+            .map(|input| OutPoint::from_str(&input.outpoint))
+            .collect::<Result<Vec<_>, _>>()?;
+        check_unspent(client, &batch_outpoints).await?;
+        let psbt = Psbt::from_str(&batch.psbt)?;
+        let signed = match remote_sign(
+            &psbt,
+            &approved.signer_network,
+            args.signer_url.as_deref().context("missing signer URL")?,
+            args.signer_auth_key
+                .as_deref()
+                .context("missing signer auth key")?,
+            approved.max_signer_request_bytes,
+        )
+        .await
+        {
+            Ok(signed) => signed,
+            Err(error) => {
+                manifest.status = if manifest.signed_artifacts.is_empty() {
+                    BatchSetStatus::Signing
+                } else {
+                    BatchSetStatus::PartiallySigned
+                };
+                manifest.last_error = Some(format!(
+                    "batch {} signing failed: {error:#}",
+                    batch.batch_index
+                ));
+                persist_batch_manifest(&manifest_path, &manifest, false)?;
+                return Err(error).with_context(|| format!("signing batch {}", batch.batch_index));
+            }
+        };
+        let artifact = artifact_for_signed_batch(
+            &approved,
+            batch,
+            &signed,
+            wallet.latest_checkpoint().hash().to_string(),
+        )?;
+        let artifact_file = batch_artifact_file(batch);
+        let artifact_sha256 = maintenance_artifact_digest(&artifact)?;
+        manifest.signed_artifacts.push(SignedBatchRecord {
+            batch_index: batch.batch_index,
+            txid: artifact.txid.clone(),
+            artifact_file: artifact_file.clone(),
+            artifact_sha256,
+            materialized: false,
+            artifact,
+        });
+        manifest
+            .signed_artifacts
+            .sort_by_key(|record| record.batch_index);
+        manifest.status = if manifest.signed_artifacts.len() == approved.batches.len() {
+            BatchSetStatus::FullySigned
+        } else {
+            BatchSetStatus::PartiallySigned
+        };
+        manifest.last_error = None;
+        // Reserve the exact signed transaction durably inside the global manifest before
+        // creating its separate artifact. Resume can materialize this record without signing again.
+        persist_batch_manifest(&manifest_path, &manifest, false)?;
+        if materialize_signed_records(&args.artifact_dir, &mut manifest)? {
+            persist_batch_manifest(&manifest_path, &manifest, false)?;
+        }
+    }
+    ensure!(
+        manifest.status == BatchSetStatus::FullySigned
+            && manifest.signed_artifacts.len() == approved.batches.len(),
+        "wallet-reset batch-set signing stopped before every transaction had an artifact"
+    );
+    // A complete live union check is the final gate before any artifact can be broadcast.
+    check_unspent(client, &all_outpoints).await?;
+    persist_batch_manifest(&manifest_path, &manifest, false)?;
+    println!("{}", serde_json::to_string_pretty(&manifest)?);
+    eprintln!("batch manifest: {}", manifest_path.display());
     Ok(())
 }
 
@@ -1476,20 +2791,30 @@ struct SignResponse {
     transaction: String,
 }
 
+fn signer_request_body(psbt: &Psbt, network: &str) -> Result<Vec<u8>> {
+    Ok(serde_json::to_vec(&SignRequest {
+        psbt: psbt.to_string(),
+        network,
+    })?)
+}
+
 async fn remote_sign(
     psbt: &Psbt,
     network: &str,
     signer_url: &str,
     auth_key_path: &Path,
+    max_request_bytes: usize,
 ) -> Result<Transaction> {
     let pem = fs::read_to_string(auth_key_path)
         .with_context(|| format!("reading signer auth key {}", auth_key_path.display()))?;
     let key = SigningKey::from_pkcs8_pem(&pem).context("parsing signer auth key")?;
-    let request = SignRequest {
-        psbt: psbt.to_string(),
-        network,
-    };
-    let body = serde_json::to_vec(&request)?;
+    let body = signer_request_body(psbt, network)?;
+    ensure!(
+        body.len() <= max_request_bytes,
+        "exact serialized signer JSON request is {} bytes, exceeding the {}-byte cap",
+        body.len(),
+        max_request_bytes
+    );
     let token = BASE64_STANDARD.encode(key.sign(&body).to_bytes());
     let http = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -1813,6 +3138,201 @@ fn validate_versioned_artifact(
     Ok(())
 }
 
+fn validate_batch_artifact_against_plan(
+    artifact: &MaintenanceArtifact,
+    plan: &BatchSetPlan,
+    batch: &UnsignedBatchPlan,
+) -> Result<()> {
+    ensure!(
+        artifact.version == BATCH_SET_VERSION,
+        "batch artifact is not version 4"
+    );
+    ensure!(
+        artifact.maintenance_mode == MaintenanceMode::WalletReset
+            && artifact.batch_plan_digest.as_deref() == Some(plan.plan_digest.as_str())
+            && artifact.batch_index == Some(batch.batch_index)
+            && artifact.batch_count == Some(plan.batches.len())
+            && artifact.signer_request_bytes == Some(batch.signer_request_bytes)
+            && artifact.max_signer_request_bytes == Some(plan.max_signer_request_bytes),
+        "batch artifact is not bound to its exact global plan position"
+    );
+    ensure!(
+        artifact.source_descriptor_identity.as_ref() == Some(&plan.source_descriptor_identity)
+            && artifact.destination_descriptor_identity.as_ref()
+                == Some(&plan.destination_descriptor_identity)
+            && artifact.require_drain_all
+            && artifact.eligible_input_count == plan.eligible_input_count
+            && artifact.excluded_eligible_input_count == plan.excluded_eligible_input_count
+            && artifact.preserved_input_count == 0,
+        "batch artifact global wallet-reset metadata is inconsistent"
+    );
+    ensure!(
+        artifact.xpub == plan.xpub
+            && artifact.master_fingerprint == plan.master_fingerprint
+            && artifact.signer_network == plan.signer_network
+            && artifact.destination == plan.destination
+            && artifact.destination_keychain == plan.destination_keychain
+            && artifact.destination_index == plan.destination_index
+            && artifact.exclusion_count == plan.exclusion_count
+            && artifact.exclusion_sha256 == plan.exclusion_sha256,
+        "batch artifact wallet or exclusion identity is inconsistent"
+    );
+    ensure!(
+        artifact.inputs == batch.inputs
+            && artifact.outputs == batch.outputs
+            && artifact.psbt == batch.psbt
+            && artifact.txid == batch.unsigned_txid
+            && artifact.fee_sats == batch.fee_sats
+            && artifact.planned_output_count == batch.planned_output_count
+            && artifact.conservative_weight_wu == batch.conservative_weight_wu
+            && artifact.max_fee_sats == plan.max_fee_sats_per_batch
+            && artifact.max_weight_wu == plan.max_weight_wu_per_batch,
+        "batch artifact differs from its exact unsigned batch plan"
+    );
+    let signed: Transaction = deserialize(&hex::decode(&artifact.signed_tx_hex)?)?;
+    let psbt = Psbt::from_str(&artifact.psbt)?;
+    let prevouts = input_records_prevouts(&artifact.inputs)?;
+    verify_signed_transaction_with_prevouts(&psbt, &signed, prevouts.clone())?;
+    ensure!(
+        signed.compute_txid().to_string() == batch.unsigned_txid
+            && transaction_fee_with_prevouts(&signed, &prevouts)? == batch.fee_sats
+            && signed.weight().to_wu() == artifact.weight_wu
+            && artifact.weight_wu <= batch.conservative_weight_wu,
+        "batch artifact signed transaction is inconsistent"
+    );
+    Ok(())
+}
+
+fn load_batch_manifest_for_artifact(
+    path: &Path,
+    artifact_path: &Path,
+    artifact: &MaintenanceArtifact,
+    confirmed_digest: Option<&str>,
+) -> Result<BatchSetManifest> {
+    let manifest: BatchSetManifest = serde_json::from_slice(&fs::read(path)?)?;
+    ensure!(
+        manifest.version == BATCH_SET_VERSION
+            && manifest.plan_digest == manifest.plan.plan_digest
+            && confirmed_digest == Some(manifest.plan_digest.as_str()),
+        "batch manifest version or confirmed plan digest is inconsistent"
+    );
+    validate_batch_set_plan(&manifest.plan)?;
+    let reserved = manifest
+        .plan
+        .batches
+        .iter()
+        .flat_map(|batch| batch.inputs.iter().map(|input| input.outpoint.as_str()))
+        .collect::<Vec<_>>();
+    ensure!(
+        manifest.reserved_input_count == reserved.len()
+            && manifest.reserved_inputs_sha256 == reserved_inputs_digest(reserved.iter().copied())?,
+        "batch manifest reserved input inventory is inconsistent"
+    );
+    ensure!(
+        manifest.status == BatchSetStatus::FullySigned
+            && manifest.signed_artifacts.len() == manifest.plan.batches.len(),
+        "batch manifest is not fully signed; no artifact may be broadcast"
+    );
+    let mut seen_indices = HashSet::new();
+    for record in &manifest.signed_artifacts {
+        ensure!(
+            record.materialized && seen_indices.insert(record.batch_index),
+            "batch manifest has an unmaterialized or duplicate signed record"
+        );
+        let batch = manifest
+            .plan
+            .batches
+            .get(record.batch_index.saturating_sub(1))
+            .context("batch manifest signed record index is out of range")?;
+        ensure!(
+            batch.batch_index == record.batch_index
+                && record.txid == batch.unsigned_txid
+                && record.artifact_file == batch_artifact_file(batch)
+                && record.artifact_sha256 == maintenance_artifact_digest(&record.artifact)?,
+            "batch manifest signed record is inconsistent"
+        );
+        validate_batch_artifact_against_plan(&record.artifact, &manifest.plan, batch)?;
+    }
+    let artifact_index = artifact
+        .batch_index
+        .context("version 4 artifact has no batch index")?;
+    let record = manifest
+        .signed_artifacts
+        .iter()
+        .find(|record| record.batch_index == artifact_index)
+        .context("artifact is not present in the fully-signed batch manifest")?;
+    ensure!(
+        record.artifact == *artifact
+            && artifact_path.file_name().and_then(|name| name.to_str())
+                == Some(record.artifact_file.as_str()),
+        "artifact file does not match its exact global manifest record"
+    );
+    Ok(manifest)
+}
+
+async fn check_batch_manifest_outspends(
+    client: &esplora_client::AsyncClient,
+    manifest: &BatchSetManifest,
+    current_batch_index: usize,
+) -> Result<bool> {
+    let expected = manifest
+        .plan
+        .batches
+        .iter()
+        .flat_map(|batch| {
+            batch.inputs.iter().map(move |input| {
+                Ok::<_, anyhow::Error>((
+                    OutPoint::from_str(&input.outpoint)?,
+                    Txid::from_str(&batch.unsigned_txid)?,
+                    batch.batch_index,
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let statuses = stream::iter(expected)
+        .map(|(outpoint, expected_spender, batch_index)| {
+            let client = client.clone();
+            async move {
+                let status = client
+                    .get_output_status(&outpoint.txid, u64::from(outpoint.vout))
+                    .await?
+                    .with_context(|| format!("Esplora does not know outpoint {outpoint}"))?;
+                Ok::<_, anyhow::Error>((outpoint, expected_spender, batch_index, status))
+            }
+        })
+        .buffer_unordered(16)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let mut current_spent = 0_usize;
+    let mut current_total = 0_usize;
+    for (outpoint, expected_spender, batch_index, status) in statuses {
+        if batch_index == current_batch_index {
+            current_total += 1;
+        }
+        if !status.spent {
+            continue;
+        }
+        match status.txid {
+            Some(spender) if spender == expected_spender => {
+                if batch_index == current_batch_index {
+                    current_spent += 1;
+                }
+            }
+            Some(spender) => {
+                bail!("reserved batch-set outpoint {outpoint} was spent by competing transaction {spender}")
+            }
+            None => {
+                bail!("reserved batch-set outpoint {outpoint} is spent without a reported spender")
+            }
+        }
+    }
+    ensure!(
+        current_spent == 0 || current_spent == current_total,
+        "Esplora reports a partial exact spend for the selected batch"
+    );
+    Ok(current_spent == current_total)
+}
+
 async fn broadcast(args: BroadcastArgs) -> Result<()> {
     ensure!(
         args.confirm_safe_to_broadcast == BROADCAST_CONFIRMATION,
@@ -1820,9 +3340,25 @@ async fn broadcast(args: BroadcastArgs) -> Result<()> {
     );
     let artifact: MaintenanceArtifact = serde_json::from_slice(&fs::read(&args.artifact)?)?;
     ensure!(
-        (LEGACY_ARTIFACT_VERSION..=ARTIFACT_VERSION).contains(&artifact.version),
+        (LEGACY_ARTIFACT_VERSION..=BATCH_SET_VERSION).contains(&artifact.version),
         "unsupported artifact version"
     );
+    let batch_manifest = if artifact.version == BATCH_SET_VERSION {
+        Some(load_batch_manifest_for_artifact(
+            args.batch_manifest
+                .as_deref()
+                .context("version 4 batch artifact requires --batch-manifest")?,
+            &args.artifact,
+            &artifact,
+            args.confirm_batch_plan_digest.as_deref(),
+        )?)
+    } else {
+        ensure!(
+            args.batch_manifest.is_none() && args.confirm_batch_plan_digest.is_none(),
+            "batch manifest options are valid only for version 4 artifacts"
+        );
+        None
+    };
     let artifact_txid = Txid::from_str(&artifact.txid)?;
     ensure!(
         args.confirm_txid == artifact_txid,
@@ -1856,7 +3392,7 @@ async fn broadcast(args: BroadcastArgs) -> Result<()> {
         artifact.weight_wu <= MAX_STANDARD_WEIGHT_WU,
         "artifact exceeds Bitcoin's standardness weight limit"
     );
-    if artifact.version == ARTIFACT_VERSION {
+    if artifact.version >= ARTIFACT_VERSION {
         let conservative_weight_wu = conservative_signed_p2wpkh_weight(&psbt.unsigned_tx);
         ensure!(
             artifact.conservative_weight_wu == conservative_weight_wu,
@@ -1879,7 +3415,9 @@ async fn broadcast(args: BroadcastArgs) -> Result<()> {
         destination.script_pubkey() == destination_script,
         "artifact destination address and script are inconsistent"
     );
-    validate_versioned_artifact(&artifact, &destination, &destination_script)?;
+    if artifact.version <= ARTIFACT_VERSION {
+        validate_versioned_artifact(&artifact, &destination, &destination_script)?;
+    }
     ensure!(
         signed
             .output
@@ -1900,6 +3438,30 @@ async fn broadcast(args: BroadcastArgs) -> Result<()> {
     }
 
     let client = esplora_client(&args.esplora_url)?;
+    if let Some(manifest) = &batch_manifest {
+        let already_spent = check_batch_manifest_outspends(
+            &client,
+            manifest,
+            artifact
+                .batch_index
+                .context("batch artifact has no index")?,
+        )
+        .await?;
+        if already_spent {
+            let status = client.get_tx_status(&artifact_txid).await?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "txid": artifact_txid,
+                    "publication": "already_known",
+                    "confirmed": status.confirmed,
+                    "block_height": status.block_height,
+                    "batch_plan_digest": manifest.plan_digest,
+                })
+            );
+            return Ok(());
+        }
+    }
     let statuses = stream::iter(prevouts.keys().copied())
         .map(|outpoint| {
             let client = client.clone();
@@ -1989,6 +3551,37 @@ fn write_create_only(path: &Path, bytes: &[u8]) -> Result<()> {
                 path.display()
             )
         })?;
+        OpenOptions::new().read(true).open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    let _ = fs::remove_file(&temp_path);
+    result
+}
+
+fn write_replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("reading manifest metadata: {}", path.display()))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "refusing to replace a non-regular or symbolic-link manifest"
+    );
+    let parent = path.parent().context("manifest path has no parent")?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("invalid manifest filename")?;
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let temp_path = parent.join(format!(".{file_name}.tmp-{}-{nonce}", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp_path)?;
+        file.write_all(bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temp_path, path)?;
         OpenOptions::new().read(true).open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -2253,6 +3846,11 @@ mod tests {
             conservative_weight_wu: 600,
             max_fee_sats: 2_000,
             max_weight_wu: 1_000,
+            batch_plan_digest: None,
+            batch_index: None,
+            batch_count: None,
+            signer_request_bytes: None,
+            max_signer_request_bytes: None,
         };
         (artifact, destination, destination_script)
     }
@@ -2291,6 +3889,164 @@ mod tests {
         );
         assert!(write_create_only(&path, b"second").is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "first\n");
+    }
+
+    #[test]
+    fn value_proportional_batch_outputs_are_exact_and_deterministic() {
+        let values = [10_u64, 20, 70];
+        let first = distribute_reset_outputs_by_value(20, &values, 10).unwrap();
+        let second = distribute_reset_outputs_by_value(20, &values, 10).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.iter().sum::<usize>(), 20);
+        assert!(first.iter().all(|count| (1..=10).contains(count)));
+        assert!(first[2] > first[1] && first[1] >= first[0]);
+    }
+
+    fn repeated_parent_psbt(padding_bytes: usize, spent_outputs: usize) -> (Transaction, Psbt) {
+        let secp = Secp256k1::new();
+        let secret_key = SecretKey::from_slice(&[77; 32]).unwrap();
+        let public_key = bdk_wallet::bitcoin::PublicKey::new(
+            bdk_wallet::bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key),
+        );
+        let script_pubkey = ScriptBuf::new_p2wpkh(&public_key.wpubkey_hash().unwrap());
+        let mut parent_outputs = (0..spent_outputs)
+            .map(|_| TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: script_pubkey.clone(),
+            })
+            .collect::<Vec<_>>();
+        parent_outputs.push(TxOut {
+            value: Amount::ZERO,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51; padding_bytes]),
+        });
+        let parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([76; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: parent_outputs,
+        };
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: (0..spent_outputs)
+                .map(|vout| TxIn {
+                    previous_output: OutPoint::new(parent.compute_txid(), vout as u32),
+                    script_sig: ScriptBuf::new(),
+                    sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                    witness: Witness::new(),
+                })
+                .collect(),
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000 * spent_outputs as u64),
+                script_pubkey,
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned).unwrap();
+        for (index, input) in psbt.inputs.iter_mut().enumerate() {
+            input.witness_utxo = Some(parent.output[index].clone());
+            input.non_witness_utxo = Some(parent.clone());
+        }
+        (parent, psbt)
+    }
+
+    #[test]
+    fn exact_signer_size_counts_each_repeated_full_parent() {
+        let (parent, two_inputs) = repeated_parent_psbt(40_000, 2);
+        let mut one_input = two_inputs.clone();
+        one_input.unsigned_tx.input.truncate(1);
+        one_input.inputs.truncate(1);
+        let one_size = signer_request_body(&one_input, "mutinynet").unwrap().len();
+        let two_size = signer_request_body(&two_inputs, "mutinynet").unwrap().len();
+        assert!(two_size > one_size + serialize(&parent).len());
+        assert!(two_size < DEFAULT_MAX_SIGNER_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn one_huge_parent_is_rejected_by_the_default_request_cap() {
+        let (_, psbt) = repeated_parent_psbt(800_000, 1);
+        let size = signer_request_body(&psbt, "mutinynet").unwrap().len();
+        assert!(size > DEFAULT_MAX_SIGNER_REQUEST_BYTES);
+        assert!(size > ABSOLUTE_MAX_SIGNER_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn partial_signed_record_resumes_without_resigning_and_rejects_tampering() {
+        let dir = tempdir().unwrap();
+        let (artifact, _, _) = bridge_artifact_fixture();
+        let mut record = SignedBatchRecord {
+            batch_index: 1,
+            txid: artifact.txid.clone(),
+            artifact_file: "batch-001.json".to_owned(),
+            artifact_sha256: maintenance_artifact_digest(&artifact).unwrap(),
+            materialized: false,
+            artifact,
+        };
+        assert!(materialize_signed_record(dir.path(), &mut record).unwrap());
+        assert!(record.materialized);
+        assert!(!materialize_signed_record(dir.path(), &mut record).unwrap());
+
+        fs::write(dir.path().join("batch-001.json"), b"{}\n").unwrap();
+        assert!(materialize_signed_record(dir.path(), &mut record).is_err());
+    }
+
+    #[test]
+    fn batch_plan_digest_detects_safety_parameter_tampering() {
+        let identity = bip84_descriptor_identity(
+            Xpub::from_str(
+                "tpubDC2Qwo2TFsaNC4ju8nrUJ9mqVT3eSgdmy1yPqhgkjwmke3PRXutNGRYAUo6RCHTcVQaDR3ohNU9we59brGHuEKPvH1ags2nevW5opEE9Z5Q",
+            )
+            .unwrap(),
+            Fingerprint::from_str("c55b303f").unwrap(),
+            Network::Signet,
+            true,
+        )
+        .unwrap();
+        let plan = BatchSetPlan {
+            version: BATCH_SET_VERSION,
+            plan_digest: String::new(),
+            snapshot_tip_height: 1,
+            remote_tip_height: 1,
+            known_utxo_sync_performed: true,
+            revealed_script_sync_performed: true,
+            maintenance_mode: MaintenanceMode::WalletReset,
+            source_descriptor_identity: identity.clone(),
+            destination_descriptor_identity: identity,
+            require_drain_all: true,
+            eligible_input_count: 0,
+            excluded_eligible_input_count: 0,
+            preserved_input_count: 0,
+            planned_output_count: 0,
+            destination: "tb1qfixture".to_owned(),
+            destination_keychain: "internal".to_owned(),
+            destination_index: 0,
+            xpub: "fixture".to_owned(),
+            master_fingerprint: "fixture".to_owned(),
+            signer_network: "mutinynet".to_owned(),
+            exclusion_count: 0,
+            exclusion_sha256: exclusion_digest(&HashSet::new()),
+            total_input_sats: 0,
+            total_output_sats: 0,
+            total_fee_sats: 0,
+            requested_fee_rate_sat_vb: 3,
+            max_inputs_per_batch: 100,
+            max_outputs_per_batch: 100,
+            max_total_fee_sats: 200_000,
+            max_fee_sats_per_batch: 50_000,
+            max_weight_wu_per_batch: 200_000,
+            max_signer_request_bytes: DEFAULT_MAX_SIGNER_REQUEST_BYTES,
+            unsigned_txids: Vec::new(),
+            batches: Vec::new(),
+        }
+        .seal()
+        .unwrap();
+        let mut tampered = plan.clone();
+        tampered.max_signer_request_bytes -= 1;
+        assert_ne!(tampered.computed_digest().unwrap(), plan.plan_digest);
     }
 
     fn signed_p2wpkh_fixture() -> (Psbt, Transaction, HashMap<OutPoint, TxOut>) {

@@ -15,7 +15,7 @@ sequenceDiagram
     Operator->>Snapshot: inspect and refresh known UTXOs
     Snapshot->>Esplora: fetch outspends, transactions, and tip
     Operator->>Snapshot: create durable unsigned plan
-    Operator->>Snapshot: approve exact PSBT and txid
+    Operator->>Snapshot: approve exact PSBT/txid or batch-set digest
     Snapshot->>Esplora: verify each input is unspent
     Snapshot->>Signer: send authenticated PSBT
     Signer-->>Snapshot: return signed transaction
@@ -63,6 +63,7 @@ The tool also enforces these properties:
 - A refreshed snapshot can use chain-only updates while the wallet-spender gate remains active.
 - A create-only unsigned plan must exist before the signer receives the PSBT.
 - Each transaction contains at most 500 inputs and 100 outputs by default.
+- The exact serialized signer JSON body must fit the configured cap; the default is 900 KiB.
 - The signer cannot change the inputs, outputs, sequences, version, or lock time.
 - Bitcoin consensus and an independent P2WPKH signature check must pass.
 - Artifact files use create-only, mode `0600` writes with durable parent-directory sync.
@@ -77,15 +78,27 @@ Wallet-reset mode adds these requirements:
 - Set `--min-confirmations 1` and `--preserve-largest 0`.
 - Set `--require-drain-all`.
 - Sync every script already revealed in both persisted source descriptors during plan creation and signing.
-- Use an empty artifact directory.
+- Use an empty artifact directory for a new plan and signing run.
 - Select every confirmed source UTXO except an outpoint in the mandatory exclusion manifest.
-- Create the reset as one transaction within the configured input, output, fee, and weight caps.
+- Partition the exact selected union into a deterministic version 4 batch set.
+- Include each selected outpoint exactly once across the set.
+- Treat `--reset-output-count` as an exact set total and allocate at least one output per batch in proportion to batch value.
+- Enforce the input, output, signer-request, fee, and weight caps on every batch.
+- Enforce `--max-fee-sats` on the aggregate set fee as well as the separate per-batch fee cap.
+- Do not broadcast any batch until the global manifest is fully signed.
 
-The version 3 plan and artifact always record the source descriptor identity.
+Version 3 single plans and artifacts always record the source descriptor identity.
 They record the destination identity when a BIP84 descriptor owns the destination.
 Each identity includes both descriptors and a canonical SHA-256 digest.
 The broadcast command derives the destination again before publication.
 The command continues to accept version 2 consolidation artifacts for broadcast and prior-artifact checks.
+
+Wallet reset uses a version 4 batch-set plan, manifest, and artifacts.
+The global plan records the exact input union, all PSBTs and unsigned txids, aggregate values and fees, every per-batch request size, and a canonical digest.
+The mutable manifest reserves every planned input before the first signer call.
+It journals each signed artifact inside the manifest before it creates the separate create-only artifact file.
+A repeated signing command resumes the exact plan and materializes a journaled artifact without signing it again.
+Version 2 and version 3 single-artifact broadcast remains supported without a batch manifest.
 
 Bridge mode adds these requirements:
 
@@ -257,16 +270,20 @@ Create the unsigned plan:
   --max-outputs 100 \
   --fee-rate-sat-vb 3 \
   --max-fee-sats 200000 \
+  --max-fee-sats-per-batch 200000 \
   --max-weight-wu 200000 \
+  --max-signer-request-bytes 921600 \
   --dry-run \
-  --plan-output /secure/wallet-reset-plan.json
+  --plan-output /secure/wallet-reset-plan-v4.json
 ```
 
-The command fails if one non-excluded confirmed UTXO cannot fit within `--max-inputs`.
-It also fails if the transaction exceeds a fee or weight cap.
-Do not split a reset across multiple plans because a partial reset defeats the drain invariant.
+The command sorts inputs deterministically by their exact one-input signer request size and outpoint.
+It measures the complete JSON request after BDK adds each full `non_witness_utxo`; repeated parent transactions therefore count once per PSBT input.
+It creates as many bounded transactions as the limits require.
+The command fails if one input cannot fit by itself, if the exact output total cannot fit, or if the aggregate fee exceeds `--max-fee-sats`.
+Do not create multiple independent plans: the one version 4 plan is the full-drain invariant.
 
-Review both descriptor identities, every input, the exclusion digest, all outputs, and the fee.
+Review both descriptor identities, every input exactly once, the exclusion digest, all outputs, every signer request size, the aggregate fee, all unsigned txids, and `plan_digest`.
 Then sign the unchanged plan:
 
 ```bash
@@ -292,17 +309,39 @@ Then sign the unchanged plan:
   --max-outputs 100 \
   --fee-rate-sat-vb 3 \
   --max-fee-sats 200000 \
+  --max-fee-sats-per-batch 200000 \
   --max-weight-wu 200000 \
-  --approved-plan /secure/wallet-reset-plan.json \
-  --confirm-plan-txid '<UNSIGNED_TXID>' \
+  --max-signer-request-bytes 921600 \
+  --approved-plan /secure/wallet-reset-plan-v4.json \
+  --confirm-batch-plan-digest '<PLAN_DIGEST>' \
   --signer-url 'http://signer.staging.int.voltageapp.io:8888/v1/sign' \
   --signer-auth-key /secure/fulfillment.pvt.pem \
   --signer-network mutinynet \
   --confirm-maintenance 'wallet-spenders-paused,prepared-inputs-excluded,inputs-compliant'
 ```
 
-Broadcast the artifact with the standard `broadcast` command.
-Wait for confirmation before you change the fulfillment descriptor configuration.
+The signing command writes one `batch-set-<PLAN_DIGEST>.manifest.json` plus one create-only artifact per batch.
+If a signer call fails after earlier batches signed, keep the wallet-spender gate active and repeat the identical command.
+The manifest remains `partially_signed`, reserves all inputs, and resumes at the first unsigned batch.
+
+Confirm that the manifest is `fully_signed` before publication.
+Broadcast each exact batch artifact separately and supply the same manifest and plan digest:
+
+```bash
+"$task_plank_bin" broadcast \
+  --artifact /secure/wallet-reset-artifacts/batch-001-<TXID>.json \
+  --batch-manifest /secure/wallet-reset-artifacts/batch-set-<PLAN_DIGEST>.manifest.json \
+  --confirm-batch-plan-digest '<PLAN_DIGEST>' \
+  --esplora-url 'http://electrs-mutinynet.bitcoind:3000' \
+  --confirm-txid '<TXID>' \
+  --confirm-fee-sats '<BATCH_FEE_SATS>' \
+  --confirm-safe-to-broadcast 'exclusive-maintenance-window-active'
+```
+
+Before each publication, the command checks the full reserved input union.
+An input must be unspent or already spent by its own exact planned batch transaction.
+A competing spend fails closed.
+Wait for every batch confirmation before you change the fulfillment descriptor configuration.
 
 CAUTION: Keep the old descriptor and signer path available for each excluded prepared input.
 Those funds remain in the source wallet until their payment lifecycle finishes.
@@ -466,6 +505,8 @@ A new descriptor and SQLite store are required to remove that history cost.
 | `inspect` reports tip lag | Keep wallet spenders paused and repeat the synchronization. |
 | `prepare` reports a spent input | Refresh the exclusion set and create a new snapshot before signing. |
 | Signer request fails | Do not create or broadcast an artifact. Diagnose the signer authentication or wallet key. |
+| Batch signing stops partway | Keep all spenders paused. Repeat the identical approved-plan command; the manifest resumes without changing reserved inputs. |
+| One input exceeds the signer request cap | Do not increase the cap above 1 MiB. Reconcile or spend that input through a separately reviewed path. |
 | Artifact write fails after signing | Keep wallet spenders paused. Repeat signing only from the same durable approved plan. |
 | Broadcast returns an error | Query the exact txid. Do not replan while publication is ambiguous. |
 | Competing spend is present | Stop the maintenance run and reconcile the owner of that outpoint. |
