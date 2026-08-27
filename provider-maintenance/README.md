@@ -207,6 +207,29 @@ Remove the wallet-spender gate only after these conditions are true:
 Keep synthetic traffic stopped during the initial fulfillment synchronization.
 Enable low-rate traffic only after one receive and one send succeed.
 
+## Staging validation
+
+The tool completed a live Mutinynet maintenance run on 2026-08-27.
+Fulfillment stayed online behind a read-only, receive-only wallet-spender gate.
+
+| Measurement | Before | After |
+| --- | ---: | ---: |
+| Confirmed UTXOs | 4,282 | 135 |
+| Confirmed balance | 99,743,236,778 sats | 99,742,351,001 sats |
+| Snapshot tip lag | 0 blocks | 0 blocks |
+
+The run used nine serial transactions and waited for each confirmation.
+The transactions spent 4,280 unique inputs and created 133 owned outputs.
+Total fees were 885,777 sats, which exactly matched the balance change.
+The UTXO count decreased by 96.85 percent.
+
+The live fulfillment wallet restarted with 135 compliant UTXOs and zero pending outpoints.
+Its initial BDK sync completed and enabled on-chain sends.
+
+Consolidation did not remove the historical transaction graph or revealed scripts.
+The live metrics scan still took approximately 65 to 66 seconds.
+A new descriptor and SQLite store are required to remove that history cost.
+
 ## Failure handling
 
 | Failure | Required action |
