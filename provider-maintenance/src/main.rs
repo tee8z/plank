@@ -28,7 +28,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
-const ARTIFACT_VERSION: u32 = 1;
+const ARTIFACT_VERSION: u32 = 2;
 const MAX_STANDARD_WEIGHT_WU: u64 = 400_000;
 const MAX_SIGNER_RESPONSE_BYTES: u64 = 1_048_576;
 const MAX_POST_SYNC_TIP_LAG: u32 = 12;
