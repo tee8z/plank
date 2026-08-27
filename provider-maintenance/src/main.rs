@@ -11,24 +11,25 @@ use base64::prelude::*;
 use bdk_core::spk_client::SyncRequest;
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_sqlite::Store;
-use bdk_wallet::bitcoin::bip32::{Fingerprint, Xpub};
+use bdk_wallet::bitcoin::bip32::{ChildNumber, Fingerprint, Xpub};
 use bdk_wallet::bitcoin::consensus::{deserialize, serialize};
 use bdk_wallet::bitcoin::hashes::{sha256, Hash};
 use bdk_wallet::bitcoin::hex::DisplayHex;
 use bdk_wallet::bitcoin::sighash::SighashCache;
 use bdk_wallet::bitcoin::{
     absolute::LockTime, Address, Amount, FeeRate, Network, OutPoint, Psbt, ScriptBuf, Transaction,
-    TxOut, Txid,
+    TxOut, Txid, Witness,
 };
-use bdk_wallet::template::Bip84Public;
+use bdk_wallet::template::{Bip84Public, DescriptorTemplate};
 use bdk_wallet::{KeychainKind, LocalOutput, PersistedWallet, TxOrdering, Wallet};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use ed25519_dalek::pkcs8::DecodePrivateKey;
 use ed25519_dalek::{Signer, SigningKey};
 use futures::{stream, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 
-const ARTIFACT_VERSION: u32 = 2;
+const ARTIFACT_VERSION: u32 = 3;
+const LEGACY_ARTIFACT_VERSION: u32 = 2;
 const MAX_STANDARD_WEIGHT_WU: u64 = 400_000;
 const MAX_SIGNER_RESPONSE_BYTES: u64 = 1_048_576;
 const MAX_POST_SYNC_TIP_LAG: u32 = 12;
@@ -36,6 +37,17 @@ const UTXO_SYNC_PARALLEL_REQUESTS: usize = 16;
 const PREPARE_CONFIRMATION: &str =
     "wallet-spenders-paused,prepared-inputs-excluded,inputs-compliant";
 const BROADCAST_CONFIRMATION: &str = "exclusive-maintenance-window-active";
+const FRESH_WALLET_CONFIRMATION: &str = "fresh-bip84-account-xpub-verified";
+const BRIDGE_WALLET_CONFIRMATION: &str = "temporary-bridge-wallet-control-verified";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+enum MaintenanceMode {
+    #[default]
+    Consolidate,
+    WalletReset,
+    Bridge,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -92,21 +104,48 @@ struct InspectArgs {
 struct PrepareArgs {
     #[command(flatten)]
     wallet: WalletArgs,
-    /// Required frozen manifest of prepared-payment `txid:vout` entries, one per line.
+    /// Frozen prepared-payment `txid:vout` manifest. Bridge mode requires zero entries.
     #[arg(long)]
     exclude_outpoints: PathBuf,
-    /// Existing artifact directory. Inputs in prior artifacts are excluded automatically.
+    /// Artifact directory. Bridge mode requires this directory to be completely empty.
     #[arg(long)]
     artifact_dir: PathBuf,
     /// Reuse a snapshot that completed `inspect`; refresh only its chain tip and live outspends.
     #[arg(long)]
     reuse_synced_snapshot: bool,
-    /// Destination address. It must be a revealed address owned by this wallet snapshot.
+    /// Consolidate, reset to fresh BIP84 descriptors, or drain to a temporary bridge wallet.
+    #[arg(long, value_enum, default_value_t)]
+    mode: MaintenanceMode,
+    /// Owned consolidation address or external Signet bridge address. Omit for wallet reset.
     #[arg(long)]
-    destination: Address<NetworkUnchecked>,
-    /// Repeat the exact destination address. The destination must also belong to this wallet snapshot.
+    destination: Option<Address<NetworkUnchecked>>,
+    /// Repeat the exact consolidation, derived reset, or bridge destination address.
     #[arg(long)]
-    confirm_destination: Address<NetworkUnchecked>,
+    confirm_destination: Option<Address<NetworkUnchecked>>,
+    /// Fresh BIP84 account xpub. Required in wallet-reset mode.
+    #[arg(long)]
+    new_wallet_xpub: Option<Xpub>,
+    /// Root fingerprint for the fresh BIP84 account. Required in wallet-reset mode.
+    #[arg(long)]
+    new_wallet_master_fingerprint: Option<Fingerprint>,
+    /// Explicit Bitcoin network for the fresh account. Must be `signet` for Mutinynet.
+    #[arg(long)]
+    new_wallet_network: Option<Network>,
+    /// Internal-chain derivation index in the fresh BIP84 account.
+    #[arg(long)]
+    new_wallet_internal_index: Option<u32>,
+    /// Must equal `fresh-bip84-account-xpub-verified` in wallet-reset mode.
+    #[arg(long)]
+    confirm_fresh_wallet: Option<String>,
+    /// Must equal `temporary-bridge-wallet-control-verified` in bridge mode.
+    #[arg(long)]
+    confirm_bridge_wallet: Option<String>,
+    /// Require an exact eligible-source-UTXO drain. Bridge mode permits no exclusions.
+    #[arg(long)]
+    require_drain_all: bool,
+    /// Exact output count for wallet reset. Must not exceed `max_outputs`.
+    #[arg(long)]
+    reset_output_count: Option<usize>,
     /// Print and optionally save the exact unsigned plan without calling the signer.
     #[arg(long)]
     dry_run: bool,
@@ -140,7 +179,7 @@ struct PrepareArgs {
     /// Aim for outputs of this value; a final output drains the remainder.
     #[arg(long, default_value_t = 5_000_000)]
     target_output_sats: u64,
-    /// Maximum outputs in the transaction.
+    /// Maximum outputs. Bridge mode requires an explicit value of 1.
     #[arg(long, default_value_t = 100)]
     max_outputs: usize,
     /// Fee rate in sat/vB.
@@ -193,6 +232,16 @@ struct OutputRecord {
     script_pubkey_hex: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct DescriptorIdentity {
+    network: String,
+    account_xpub: String,
+    master_fingerprint: String,
+    external_descriptor: String,
+    internal_descriptor: String,
+    descriptor_sha256: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MaintenanceArtifact {
     version: u32,
@@ -201,6 +250,26 @@ struct MaintenanceArtifact {
     snapshot_tip_hash: String,
     remote_tip_height: u32,
     known_utxo_sync_performed: bool,
+    #[serde(default)]
+    revealed_script_sync_performed: bool,
+    #[serde(default)]
+    bridge_control_verified: bool,
+    #[serde(default)]
+    maintenance_mode: MaintenanceMode,
+    #[serde(default)]
+    source_descriptor_identity: Option<DescriptorIdentity>,
+    #[serde(default)]
+    destination_descriptor_identity: Option<DescriptorIdentity>,
+    #[serde(default)]
+    require_drain_all: bool,
+    #[serde(default)]
+    eligible_input_count: usize,
+    #[serde(default)]
+    excluded_eligible_input_count: usize,
+    #[serde(default)]
+    preserved_input_count: usize,
+    #[serde(default)]
+    planned_output_count: usize,
     xpub: String,
     master_fingerprint: String,
     signer_network: String,
@@ -218,6 +287,8 @@ struct MaintenanceArtifact {
     fee_sats: u64,
     fee_rate_sat_vb: f64,
     weight_wu: u64,
+    #[serde(default)]
+    conservative_weight_wu: u64,
     max_fee_sats: u64,
     max_weight_wu: u64,
 }
@@ -238,13 +309,23 @@ struct WalletSummary {
     suggested_consolidation_destination: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct UnsignedPlanReport {
     version: u32,
     unsigned_txid: String,
     snapshot_tip_height: u32,
     remote_tip_height: u32,
     known_utxo_sync_performed: bool,
+    revealed_script_sync_performed: bool,
+    bridge_control_verified: bool,
+    maintenance_mode: MaintenanceMode,
+    source_descriptor_identity: DescriptorIdentity,
+    destination_descriptor_identity: Option<DescriptorIdentity>,
+    require_drain_all: bool,
+    eligible_input_count: usize,
+    excluded_eligible_input_count: usize,
+    preserved_input_count: usize,
+    planned_output_count: usize,
     destination: String,
     destination_keychain: String,
     destination_index: u32,
@@ -258,8 +339,18 @@ struct UnsignedPlanReport {
     psbt: String,
     fee_sats: u64,
     requested_fee_rate_sat_vb: u64,
+    conservative_weight_wu: u64,
     max_fee_sats: u64,
     max_weight_wu: u64,
+}
+
+impl UnsignedPlanReport {
+    fn signing_commitment(&self) -> Self {
+        let mut commitment = self.clone();
+        commitment.snapshot_tip_height = 0;
+        commitment.remote_tip_height = 0;
+        commitment
+    }
 }
 
 type ProviderWallet = PersistedWallet<Store>;
@@ -353,6 +444,37 @@ async fn sync_snapshot(
     refresh_snapshot_tip(wallet, store, client).await
 }
 
+async fn sync_all_revealed_scripts(
+    wallet: &mut ProviderWallet,
+    store: &mut Store,
+    client: &esplora_client::AsyncClient,
+) -> Result<u32> {
+    let graph: &bdk_chain::TxGraph<bdk_core::ConfirmationBlockTime> = wallet.as_ref();
+    let known_txids = graph
+        .full_txs()
+        .map(|transaction| transaction.txid)
+        .collect::<Vec<_>>();
+    let known_outpoints = wallet
+        .list_unspent()
+        .map(|output| output.outpoint)
+        .collect::<Vec<_>>();
+    ensure!(
+        !known_txids.is_empty() && !known_outpoints.is_empty(),
+        "source-wallet snapshot contains no persisted transaction inventory"
+    );
+    let request = wallet
+        .start_sync_with_revealed_spks()
+        .txids(known_txids)
+        .outpoints(known_outpoints);
+    let update = client
+        .sync(request, UTXO_SYNC_PARALLEL_REQUESTS)
+        .await
+        .context("syncing every revealed source-wallet script and known transaction")?;
+    wallet.apply_update(update)?;
+    wallet.persist_async(store).await?;
+    refresh_snapshot_tip(wallet, store, client).await
+}
+
 async fn refresh_snapshot_tip(
     wallet: &mut ProviderWallet,
     store: &mut Store,
@@ -396,6 +518,293 @@ fn eligible_outputs(wallet: &ProviderWallet, min_confirmations: u32) -> Result<V
     );
     outputs.sort_by_key(|output| (output.txout.value.to_sat(), output.outpoint));
     Ok(outputs)
+}
+
+fn descriptor_identity_digest(
+    network: &str,
+    account_xpub: &str,
+    master_fingerprint: &str,
+    external_descriptor: &str,
+    internal_descriptor: &str,
+) -> String {
+    let canonical = format!(
+        "network={network}\naccount_xpub={account_xpub}\nmaster_fingerprint={master_fingerprint}\nexternal_descriptor={external_descriptor}\ninternal_descriptor={internal_descriptor}\n"
+    );
+    sha256::Hash::hash(canonical.as_bytes()).to_string()
+}
+
+fn bip84_descriptor_identity(
+    account_xpub: Xpub,
+    master_fingerprint: Fingerprint,
+    network: Network,
+    require_account_zero: bool,
+) -> Result<DescriptorIdentity> {
+    ensure!(
+        account_xpub.network == network.into(),
+        "BIP84 account xpub network does not match {network}"
+    );
+    if require_account_zero {
+        ensure!(
+            account_xpub.depth == 3
+                && account_xpub.child_number == ChildNumber::Hardened { index: 0 },
+            "fresh BIP84 xpub must be the account-zero key at depth 3"
+        );
+    }
+    let external_descriptor = Bip84Public(account_xpub, master_fingerprint, KeychainKind::External)
+        .build(network)?
+        .0
+        .to_string();
+    let internal_descriptor = Bip84Public(account_xpub, master_fingerprint, KeychainKind::Internal)
+        .build(network)?
+        .0
+        .to_string();
+    let network = network.to_string();
+    let account_xpub = account_xpub.to_string();
+    let master_fingerprint = master_fingerprint.to_string();
+    let descriptor_sha256 = descriptor_identity_digest(
+        &network,
+        &account_xpub,
+        &master_fingerprint,
+        &external_descriptor,
+        &internal_descriptor,
+    );
+    Ok(DescriptorIdentity {
+        network,
+        account_xpub,
+        master_fingerprint,
+        external_descriptor,
+        internal_descriptor,
+        descriptor_sha256,
+    })
+}
+
+fn validate_descriptor_identity(
+    identity: &DescriptorIdentity,
+    require_account_zero: bool,
+) -> Result<(Xpub, Fingerprint, Network)> {
+    let account_xpub = Xpub::from_str(&identity.account_xpub)
+        .context("descriptor identity contains an invalid account xpub")?;
+    let master_fingerprint = Fingerprint::from_str(&identity.master_fingerprint)
+        .context("descriptor identity contains an invalid master fingerprint")?;
+    let network = Network::from_str(&identity.network)
+        .context("descriptor identity contains an invalid network")?;
+    let rebuilt = bip84_descriptor_identity(
+        account_xpub,
+        master_fingerprint,
+        network,
+        require_account_zero,
+    )?;
+    ensure!(
+        rebuilt == *identity,
+        "descriptor identity does not match its BIP84 account parameters"
+    );
+    Ok((account_xpub, master_fingerprint, network))
+}
+
+fn derive_bip84_destination(
+    identity: &DescriptorIdentity,
+    keychain: KeychainKind,
+    index: u32,
+    require_account_zero: bool,
+) -> Result<Address> {
+    let (account_xpub, master_fingerprint, network) =
+        validate_descriptor_identity(identity, require_account_zero)?;
+    let descriptor = Bip84Public(account_xpub, master_fingerprint, keychain)
+        .build(network)?
+        .0;
+    let script = descriptor
+        .at_derivation_index(index)
+        .context("deriving BIP84 destination index")?
+        .script_pubkey();
+    Address::from_script(&script, network).context("derived BIP84 script has no address")
+}
+
+fn verify_drain_all_outpoints(
+    eligible: &[OutPoint],
+    excluded: &HashSet<OutPoint>,
+    selected: &[OutPoint],
+) -> Result<usize> {
+    let eligible_set = eligible.iter().copied().collect::<HashSet<_>>();
+    ensure!(
+        eligible_set.len() == eligible.len(),
+        "eligible source-wallet set contains duplicate outpoints"
+    );
+    let selected_set = selected.iter().copied().collect::<HashSet<_>>();
+    ensure!(
+        selected_set.len() == selected.len(),
+        "wallet-reset selection contains duplicate outpoints"
+    );
+    let expected = eligible_set
+        .difference(excluded)
+        .copied()
+        .collect::<HashSet<_>>();
+    let missing = expected.difference(&selected_set).count();
+    let extra = selected_set.difference(&expected).count();
+    ensure!(
+        missing == 0 && extra == 0,
+        "wallet-reset selection is not an exact drain: {missing} omitted, {extra} extra"
+    );
+    Ok(eligible_set.intersection(excluded).count())
+}
+
+struct ResolvedDestination {
+    address: Address,
+    keychain_label: String,
+    index: u32,
+    identity: Option<DescriptorIdentity>,
+}
+
+fn resolve_destination(
+    args: &PrepareArgs,
+    wallet: &ProviderWallet,
+    source_identity: &DescriptorIdentity,
+) -> Result<ResolvedDestination> {
+    let confirmed = args
+        .confirm_destination
+        .clone()
+        .context("confirm_destination is required")?
+        .require_network(Network::Signet)?;
+    match args.mode {
+        MaintenanceMode::Consolidate => {
+            ensure!(
+                args.new_wallet_xpub.is_none()
+                    && args.new_wallet_master_fingerprint.is_none()
+                    && args.new_wallet_network.is_none()
+                    && args.new_wallet_internal_index.is_none()
+                    && args.confirm_fresh_wallet.is_none()
+                    && args.confirm_bridge_wallet.is_none()
+                    && args.reset_output_count.is_none()
+                    && !args.require_drain_all,
+                "wallet-reset options are not valid in consolidation mode"
+            );
+            let address = args
+                .destination
+                .clone()
+                .context("destination is required in consolidation mode")?
+                .require_network(Network::Signet)?;
+            ensure!(
+                address == confirmed,
+                "confirmed destination does not match destination"
+            );
+            let script = address.script_pubkey();
+            let (keychain, index) = wallet
+                .spk_index()
+                .index_of_spk(script)
+                .copied()
+                .context("destination does not belong to this wallet snapshot")?;
+            let last_revealed = wallet
+                .derivation_index(keychain)
+                .context("destination keychain has no revealed addresses")?;
+            ensure!(
+                index <= last_revealed,
+                "destination belongs to wallet lookahead but has not been revealed and persisted"
+            );
+            Ok(ResolvedDestination {
+                address,
+                keychain_label: match keychain {
+                    KeychainKind::External => "external".to_owned(),
+                    KeychainKind::Internal => "internal".to_owned(),
+                },
+                index,
+                identity: Some(source_identity.clone()),
+            })
+        }
+        MaintenanceMode::WalletReset => {
+            ensure!(
+                args.destination.is_none(),
+                "wallet reset derives its destination; do not supply --destination"
+            );
+            ensure!(
+                args.confirm_bridge_wallet.is_none(),
+                "bridge acknowledgement is not valid in wallet-reset mode"
+            );
+            ensure!(
+                args.confirm_fresh_wallet.as_deref() == Some(FRESH_WALLET_CONFIRMATION),
+                "fresh-wallet acknowledgement must be `{FRESH_WALLET_CONFIRMATION}`"
+            );
+            let account_xpub = args
+                .new_wallet_xpub
+                .context("new_wallet_xpub is required in wallet-reset mode")?;
+            let master_fingerprint = args
+                .new_wallet_master_fingerprint
+                .context("new_wallet_master_fingerprint is required in wallet-reset mode")?;
+            let network = args
+                .new_wallet_network
+                .context("new_wallet_network is required in wallet-reset mode")?;
+            ensure!(
+                network == Network::Signet,
+                "wallet reset only supports the Signet network used by Mutinynet"
+            );
+            ensure!(
+                account_xpub.to_string() != source_identity.account_xpub,
+                "fresh wallet xpub must differ from the source wallet xpub"
+            );
+            let index = args
+                .new_wallet_internal_index
+                .context("new_wallet_internal_index is required in wallet-reset mode")?;
+            let identity =
+                bip84_descriptor_identity(account_xpub, master_fingerprint, network, true)?;
+            ensure!(
+                identity.descriptor_sha256 != source_identity.descriptor_sha256,
+                "fresh wallet descriptors must differ from the source descriptors"
+            );
+            let address = derive_bip84_destination(&identity, KeychainKind::Internal, index, true)?;
+            ensure!(
+                address == confirmed,
+                "confirmed destination does not match the address derived from the fresh BIP84 account"
+            );
+            ensure!(
+                wallet
+                    .spk_index()
+                    .index_of_spk(address.script_pubkey())
+                    .is_none(),
+                "derived fresh-wallet destination belongs to the source wallet"
+            );
+            Ok(ResolvedDestination {
+                address,
+                keychain_label: "internal".to_owned(),
+                index,
+                identity: Some(identity),
+            })
+        }
+        MaintenanceMode::Bridge => {
+            ensure!(
+                args.new_wallet_xpub.is_none()
+                    && args.new_wallet_master_fingerprint.is_none()
+                    && args.new_wallet_network.is_none()
+                    && args.new_wallet_internal_index.is_none()
+                    && args.confirm_fresh_wallet.is_none()
+                    && args.reset_output_count.is_none(),
+                "fresh-wallet options are not valid in bridge mode"
+            );
+            ensure!(
+                args.confirm_bridge_wallet.as_deref() == Some(BRIDGE_WALLET_CONFIRMATION),
+                "bridge-wallet acknowledgement must be `{BRIDGE_WALLET_CONFIRMATION}`"
+            );
+            let address = args
+                .destination
+                .clone()
+                .context("destination is required in bridge mode")?
+                .require_network(Network::Signet)?;
+            ensure!(
+                address == confirmed,
+                "confirmed bridge destination does not match destination"
+            );
+            ensure!(
+                wallet
+                    .spk_index()
+                    .index_of_spk(address.script_pubkey())
+                    .is_none(),
+                "bridge destination unexpectedly belongs to the source wallet"
+            );
+            Ok(ResolvedDestination {
+                address,
+                keychain_label: "bridge".to_owned(),
+                index: 0,
+                identity: None,
+            })
+        }
+    }
 }
 
 async fn inspect(args: InspectArgs) -> Result<()> {
@@ -485,7 +894,7 @@ fn read_artifacts(dir: &Path) -> Result<Vec<MaintenanceArtifact>> {
         let artifact: MaintenanceArtifact = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("reading prior artifact {}", path.display()))?;
         ensure!(
-            artifact.version == ARTIFACT_VERSION,
+            (LEGACY_ARTIFACT_VERSION..=ARTIFACT_VERSION).contains(&artifact.version),
             "unsupported prior artifact version"
         );
         artifacts.push(artifact);
@@ -573,17 +982,56 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     }
     ensure!(args.fee_rate_sat_vb > 0, "fee rate must be positive");
     ensure!(
-        (2..=1_000).contains(&args.max_inputs),
-        "max_inputs must be between 2 and 1000"
+        (1..=1_000).contains(&args.max_inputs),
+        "max_inputs must be between 1 and 1000"
     );
     ensure!(
         (1..=100).contains(&args.max_outputs),
         "max_outputs must be between 1 and 100"
     );
-    ensure!(
-        args.target_output_sats >= 1_000,
-        "target output is unreasonably small"
-    );
+    match args.mode {
+        MaintenanceMode::Consolidate => ensure!(
+            args.target_output_sats >= 1_000,
+            "target output is unreasonably small"
+        ),
+        MaintenanceMode::WalletReset | MaintenanceMode::Bridge => {
+            let mode = match args.mode {
+                MaintenanceMode::WalletReset => "wallet-reset",
+                MaintenanceMode::Bridge => "bridge",
+                MaintenanceMode::Consolidate => unreachable!(),
+            };
+            ensure!(
+                !args.reuse_synced_snapshot,
+                "{mode} mode requires an exhaustive revealed-script sync; omit --reuse-synced-snapshot"
+            );
+            ensure!(
+                args.require_drain_all,
+                "{mode} mode requires --require-drain-all"
+            );
+            ensure!(
+                args.preserve_largest == 0,
+                "{mode} mode requires explicit --preserve-largest 0"
+            );
+            ensure!(
+                args.min_confirmations == 1,
+                "{mode} mode requires explicit --min-confirmations 1"
+            );
+            if args.mode == MaintenanceMode::WalletReset {
+                let reset_output_count = args
+                    .reset_output_count
+                    .context("reset_output_count is required in wallet-reset mode")?;
+                ensure!(
+                    (1..=args.max_outputs).contains(&reset_output_count),
+                    "reset_output_count must be between 1 and max_outputs"
+                );
+            } else {
+                ensure!(
+                    args.max_outputs == 1,
+                    "bridge mode requires explicit --max-outputs 1"
+                );
+            }
+        }
+    }
     ensure!(
         args.max_weight_wu <= MAX_STANDARD_WEIGHT_WU,
         "max_weight_wu exceeds the Bitcoin standardness limit"
@@ -597,13 +1045,36 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     let mut permissions = fs::metadata(&args.artifact_dir)?.permissions();
     permissions.set_mode(0o700);
     fs::set_permissions(&args.artifact_dir, permissions)?;
+    if args.mode == MaintenanceMode::Bridge {
+        ensure!(
+            fs::read_dir(&args.artifact_dir)?.next().is_none(),
+            "bridge mode requires a completely empty artifact directory"
+        );
+    }
 
     let (mut wallet, mut store) = open_wallet(&args.wallet).await?;
+    let source_identity = bip84_descriptor_identity(
+        args.wallet.xpub,
+        args.wallet.master_fingerprint,
+        Network::Signet,
+        false,
+    )?;
+    ensure!(
+        wallet.public_descriptor(KeychainKind::External).to_string()
+            == source_identity.external_descriptor
+            && wallet.public_descriptor(KeychainKind::Internal).to_string()
+                == source_identity.internal_descriptor,
+        "source descriptor identity does not match the loaded wallet snapshot"
+    );
     let client = esplora_client(&args.wallet.esplora_url)?;
-    let snapshot_tip = if args.reuse_synced_snapshot {
-        refresh_snapshot_tip(&mut wallet, &mut store, &client).await?
-    } else {
-        sync_snapshot(&mut wallet, &mut store, &client).await?
+    let snapshot_tip = match args.mode {
+        MaintenanceMode::WalletReset | MaintenanceMode::Bridge => {
+            sync_all_revealed_scripts(&mut wallet, &mut store, &client).await?
+        }
+        MaintenanceMode::Consolidate if args.reuse_synced_snapshot => {
+            refresh_snapshot_tip(&mut wallet, &mut store, &client).await?
+        }
+        MaintenanceMode::Consolidate => sync_snapshot(&mut wallet, &mut store, &client).await?,
     };
     let remote_tip = client.get_height().await?;
     ensure!(
@@ -618,10 +1089,26 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     );
 
     let prior_artifacts = read_artifacts(&args.artifact_dir)?;
+    if matches!(
+        args.mode,
+        MaintenanceMode::WalletReset | MaintenanceMode::Bridge
+    ) {
+        ensure!(
+            prior_artifacts.is_empty(),
+            "full-drain modes require an empty artifact directory and one exact transaction"
+        );
+    }
     require_prior_artifacts_confirmed(&client, &prior_artifacts).await?;
-    let mut excluded = load_exclusions(&args.exclude_outpoints)?;
-    let exclusion_count = excluded.len();
-    let exclusion_sha256 = exclusion_digest(&excluded);
+    let mandatory_excluded = load_exclusions(&args.exclude_outpoints)?;
+    if args.mode == MaintenanceMode::Bridge {
+        ensure!(
+            mandatory_excluded.is_empty(),
+            "bridge mode requires an explicitly supplied empty exclusion manifest"
+        );
+    }
+    let exclusion_count = mandatory_excluded.len();
+    let exclusion_sha256 = exclusion_digest(&mandatory_excluded);
+    let mut excluded = mandatory_excluded.clone();
     for artifact in &prior_artifacts {
         for input in &artifact.inputs {
             excluded.insert(OutPoint::from_str(&input.outpoint)?);
@@ -633,27 +1120,75 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     }
 
     let mut eligible = eligible_outputs(&wallet, args.min_confirmations)?;
-    ensure!(
-        eligible.len() > args.preserve_largest,
-        "no outputs remain after preserving the confirmed reserve"
-    );
-    let preserve_at = eligible.len() - args.preserve_largest;
-    let preserved = eligible.split_off(preserve_at);
-    let preserved_outpoints = preserved
-        .iter()
-        .map(|output| output.outpoint)
-        .collect::<HashSet<_>>();
-    eligible.retain(|output| {
-        !excluded.contains(&output.outpoint) && !preserved_outpoints.contains(&output.outpoint)
-    });
-    let selected = eligible
-        .into_iter()
-        .take(args.max_inputs)
-        .collect::<Vec<_>>();
-    ensure!(
-        selected.len() >= 2,
-        "fewer than two eligible outputs remain; consolidation is complete"
-    );
+    let eligible_input_count = eligible.len();
+    if args.mode == MaintenanceMode::Bridge {
+        let total_unspent = wallet.list_unspent().count();
+        ensure!(
+            eligible_input_count == total_unspent,
+            "bridge mode requires every source-wallet UTXO to be confirmed: {eligible_input_count} confirmed of {total_unspent} total"
+        );
+    }
+    let (selected, excluded_eligible_input_count, preserved_input_count) = match args.mode {
+        MaintenanceMode::Consolidate => {
+            ensure!(
+                eligible.len() > args.preserve_largest,
+                "no outputs remain after preserving the confirmed reserve"
+            );
+            let preserve_at = eligible.len() - args.preserve_largest;
+            let preserved = eligible.split_off(preserve_at);
+            let preserved_outpoints = preserved
+                .iter()
+                .map(|output| output.outpoint)
+                .collect::<HashSet<_>>();
+            let excluded_eligible_input_count = eligible
+                .iter()
+                .filter(|output| excluded.contains(&output.outpoint))
+                .count();
+            eligible.retain(|output| {
+                !excluded.contains(&output.outpoint)
+                    && !preserved_outpoints.contains(&output.outpoint)
+            });
+            let selected = eligible
+                .into_iter()
+                .take(args.max_inputs)
+                .collect::<Vec<_>>();
+            ensure!(
+                selected.len() >= 2,
+                "fewer than two eligible outputs remain; consolidation is complete"
+            );
+            (selected, excluded_eligible_input_count, preserved.len())
+        }
+        MaintenanceMode::WalletReset | MaintenanceMode::Bridge => {
+            let eligible_outpoints = eligible
+                .iter()
+                .map(|output| output.outpoint)
+                .collect::<Vec<_>>();
+            let selected = eligible
+                .into_iter()
+                .filter(|output| !mandatory_excluded.contains(&output.outpoint))
+                .collect::<Vec<_>>();
+            ensure!(
+                !selected.is_empty(),
+                "full-drain mode has no confirmed source outputs"
+            );
+            ensure!(
+                selected.len() <= args.max_inputs,
+                "full-drain mode needs {} inputs, which exceeds max_inputs {}; refuse a partial drain",
+                selected.len(),
+                args.max_inputs
+            );
+            let selected_outpoints = selected
+                .iter()
+                .map(|output| output.outpoint)
+                .collect::<Vec<_>>();
+            let excluded_eligible_input_count = verify_drain_all_outpoints(
+                &eligible_outpoints,
+                &mandatory_excluded,
+                &selected_outpoints,
+            )?;
+            (selected, excluded_eligible_input_count, 0)
+        }
+    };
 
     let selected_outpoints = selected
         .iter()
@@ -661,25 +1196,12 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         .collect::<Vec<_>>();
     check_unspent(&client, &selected_outpoints).await?;
 
-    let destination = args.destination.require_network(Network::Signet)?;
-    let confirmed_destination = args.confirm_destination.require_network(Network::Signet)?;
-    ensure!(
-        destination == confirmed_destination,
-        "confirmed destination does not match destination"
-    );
+    let resolved_destination = resolve_destination(&args, &wallet, &source_identity)?;
+    let destination = resolved_destination.address;
     let destination_script = destination.script_pubkey();
-    let (destination_keychain, destination_index) = wallet
-        .spk_index()
-        .index_of_spk(destination_script.clone())
-        .copied()
-        .context("destination does not belong to this wallet snapshot")?;
-    let last_revealed = wallet
-        .derivation_index(destination_keychain)
-        .context("destination keychain has no revealed addresses")?;
-    ensure!(
-        destination_index <= last_revealed,
-        "destination belongs to wallet lookahead but has not been revealed and persisted"
-    );
+    let destination_keychain = resolved_destination.keychain_label;
+    let destination_index = resolved_destination.index;
+    let destination_identity = resolved_destination.identity;
     let selected_total = selected
         .iter()
         .try_fold(0_u64, |total, output| {
@@ -691,9 +1213,27 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         "selected inputs cannot cover the fee cap and a non-dust output"
     );
     let available_after_fee_cap = selected_total - args.max_fee_sats;
-    let desired_outputs = usize::try_from(available_after_fee_cap / args.target_output_sats)
-        .unwrap_or(usize::MAX)
-        .clamp(1, args.max_outputs);
+    let (desired_outputs, fixed_output_sats) = match args.mode {
+        MaintenanceMode::Consolidate => (
+            usize::try_from(available_after_fee_cap / args.target_output_sats)
+                .unwrap_or(usize::MAX)
+                .clamp(1, args.max_outputs),
+            args.target_output_sats,
+        ),
+        MaintenanceMode::WalletReset => {
+            let desired_outputs = args
+                .reset_output_count
+                .context("missing reset_output_count")?;
+            let fixed_output_sats = available_after_fee_cap
+                / u64::try_from(desired_outputs).context("invalid reset output count")?;
+            ensure!(
+                fixed_output_sats >= 1_000,
+                "wallet reset cannot create the requested output count above the minimum value"
+            );
+            (desired_outputs, fixed_output_sats)
+        }
+        MaintenanceMode::Bridge => (1, available_after_fee_cap),
+    };
 
     let mut builder = wallet.build_tx();
     builder
@@ -706,7 +1246,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     for _ in 1..desired_outputs {
         builder.add_recipient(
             destination_script.clone(),
-            Amount::from_sat(args.target_output_sats),
+            Amount::from_sat(fixed_output_sats),
         );
     }
     let psbt = builder
@@ -732,6 +1272,15 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         psbt_fee <= args.max_fee_sats,
         "PSBT fee exceeds max_fee_sats"
     );
+    let conservative_weight_wu = conservative_signed_p2wpkh_weight(&psbt.unsigned_tx);
+    ensure!(
+        conservative_weight_wu <= args.max_weight_wu,
+        "conservative signed P2WPKH weight estimate exceeds max_weight_wu"
+    );
+    ensure!(
+        conservative_weight_wu <= MAX_STANDARD_WEIGHT_WU,
+        "conservative signed P2WPKH weight estimate exceeds the Bitcoin standardness limit"
+    );
 
     let unsigned_txid = psbt.unsigned_tx.compute_txid();
     let plan = UnsignedPlanReport {
@@ -740,11 +1289,21 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         snapshot_tip_height: snapshot_tip,
         remote_tip_height: remote_tip,
         known_utxo_sync_performed: !args.reuse_synced_snapshot,
+        revealed_script_sync_performed: matches!(
+            args.mode,
+            MaintenanceMode::WalletReset | MaintenanceMode::Bridge
+        ),
+        bridge_control_verified: args.mode == MaintenanceMode::Bridge,
+        maintenance_mode: args.mode,
+        source_descriptor_identity: source_identity.clone(),
+        destination_descriptor_identity: destination_identity.clone(),
+        require_drain_all: args.require_drain_all,
+        eligible_input_count,
+        excluded_eligible_input_count,
+        preserved_input_count,
+        planned_output_count: desired_outputs,
         destination: destination.to_string(),
-        destination_keychain: match destination_keychain {
-            KeychainKind::External => "external".to_owned(),
-            KeychainKind::Internal => "internal".to_owned(),
-        },
+        destination_keychain: destination_keychain.clone(),
         destination_index,
         xpub: args.wallet.xpub.to_string(),
         master_fingerprint: args.wallet.master_fingerprint.to_string(),
@@ -764,6 +1323,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         psbt: psbt.to_string(),
         fee_sats: psbt_fee,
         requested_fee_rate_sat_vb: args.fee_rate_sat_vb,
+        conservative_weight_wu,
         max_fee_sats: args.max_fee_sats,
         max_weight_wu: args.max_weight_wu,
     };
@@ -793,24 +1353,8 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         "unsupported approved plan version"
     );
     ensure!(
-        approved_plan.unsigned_txid == plan.unsigned_txid
-            && approved_plan.psbt == plan.psbt
-            && approved_plan.destination == plan.destination
-            && approved_plan.destination_keychain == plan.destination_keychain
-            && approved_plan.destination_index == plan.destination_index
-            && approved_plan.xpub == plan.xpub
-            && approved_plan.master_fingerprint == plan.master_fingerprint
-            && approved_plan.signer_network == plan.signer_network
-            && approved_plan.known_utxo_sync_performed == plan.known_utxo_sync_performed
-            && approved_plan.exclusion_count == plan.exclusion_count
-            && approved_plan.exclusion_sha256 == plan.exclusion_sha256
-            && approved_plan.inputs == plan.inputs
-            && approved_plan.outputs == plan.outputs
-            && approved_plan.fee_sats == plan.fee_sats
-            && approved_plan.requested_fee_rate_sat_vb == plan.requested_fee_rate_sat_vb
-            && approved_plan.max_fee_sats == plan.max_fee_sats
-            && approved_plan.max_weight_wu == plan.max_weight_wu,
-        "approved plan does not match the exact transaction rebuilt for signing"
+        approved_plan.signing_commitment() == plan.signing_commitment(),
+        "approved plan does not match the exact transaction and safety parameters rebuilt for signing"
     );
 
     // Recheck immediately before the signer receives an irrevocably usable transaction.
@@ -844,6 +1388,10 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         weight_wu <= MAX_STANDARD_WEIGHT_WU,
         "signed transaction is non-standard by weight"
     );
+    ensure!(
+        weight_wu <= conservative_weight_wu,
+        "signed transaction exceeds the conservative P2WPKH weight estimate"
+    );
 
     let txid = signed_tx.compute_txid();
     let artifact = MaintenanceArtifact {
@@ -853,15 +1401,25 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         snapshot_tip_hash: wallet.latest_checkpoint().hash().to_string(),
         remote_tip_height: remote_tip,
         known_utxo_sync_performed: !args.reuse_synced_snapshot,
+        revealed_script_sync_performed: matches!(
+            args.mode,
+            MaintenanceMode::WalletReset | MaintenanceMode::Bridge
+        ),
+        bridge_control_verified: args.mode == MaintenanceMode::Bridge,
+        maintenance_mode: args.mode,
+        source_descriptor_identity: Some(source_identity),
+        destination_descriptor_identity: destination_identity,
+        require_drain_all: args.require_drain_all,
+        eligible_input_count,
+        excluded_eligible_input_count,
+        preserved_input_count,
+        planned_output_count: desired_outputs,
         xpub: args.wallet.xpub.to_string(),
         master_fingerprint: args.wallet.master_fingerprint.to_string(),
         signer_network: args.signer_network,
         destination: destination.to_string(),
         destination_script_hex: destination_script.as_bytes().to_lower_hex_string(),
-        destination_keychain: match destination_keychain {
-            KeychainKind::External => "external".to_owned(),
-            KeychainKind::Internal => "internal".to_owned(),
-        },
+        destination_keychain,
         destination_index,
         exclusion_count,
         exclusion_sha256,
@@ -880,6 +1438,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         fee_sats,
         fee_rate_sat_vb: fee_sats as f64 / signed_tx.vsize() as f64,
         weight_wu,
+        conservative_weight_wu,
         max_fee_sats: args.max_fee_sats,
         max_weight_wu: args.max_weight_wu,
     };
@@ -1115,6 +1674,145 @@ fn transaction_fee_with_prevouts(
         .context("transaction outputs exceed inputs")
 }
 
+fn conservative_signed_p2wpkh_weight(unsigned_tx: &Transaction) -> u64 {
+    let mut estimated = unsigned_tx.clone();
+    for input in &mut estimated.input {
+        input.witness = Witness::from_slice(&[vec![0_u8; 73], vec![0_u8; 33]]);
+    }
+    estimated.weight().to_wu()
+}
+
+fn parse_keychain(value: &str) -> Result<KeychainKind> {
+    match value {
+        "external" => Ok(KeychainKind::External),
+        "internal" => Ok(KeychainKind::Internal),
+        _ => bail!("invalid destination keychain: {value}"),
+    }
+}
+
+fn validate_versioned_artifact(
+    artifact: &MaintenanceArtifact,
+    destination: &Address,
+    destination_script: &ScriptBuf,
+) -> Result<()> {
+    if artifact.version == LEGACY_ARTIFACT_VERSION {
+        return Ok(());
+    }
+    ensure!(
+        artifact.version == ARTIFACT_VERSION,
+        "unsupported artifact version"
+    );
+    let source_identity = artifact
+        .source_descriptor_identity
+        .as_ref()
+        .context("version 3 artifact has no source descriptor identity")?;
+    validate_descriptor_identity(source_identity, false)?;
+    ensure!(
+        artifact.xpub == source_identity.account_xpub
+            && artifact.master_fingerprint == source_identity.master_fingerprint,
+        "artifact source wallet fields do not match the source descriptor identity"
+    );
+    ensure!(
+        artifact.planned_output_count == artifact.outputs.len(),
+        "artifact output count differs from its approved plan metadata"
+    );
+    match artifact.maintenance_mode {
+        MaintenanceMode::Consolidate | MaintenanceMode::WalletReset => {
+            let destination_identity = artifact
+                .destination_descriptor_identity
+                .as_ref()
+                .context("descriptor-owned artifact has no destination descriptor identity")?;
+            let require_fresh_account = artifact.maintenance_mode == MaintenanceMode::WalletReset;
+            validate_descriptor_identity(destination_identity, require_fresh_account)?;
+            let keychain = parse_keychain(&artifact.destination_keychain)?;
+            let derived_destination = derive_bip84_destination(
+                destination_identity,
+                keychain,
+                artifact.destination_index,
+                require_fresh_account,
+            )?;
+            ensure!(
+                derived_destination == *destination
+                    && derived_destination.script_pubkey() == *destination_script,
+                "artifact destination does not match its descriptor identity and derivation index"
+            );
+            ensure!(
+                !artifact.bridge_control_verified,
+                "descriptor-owned artifact contains bridge-control metadata"
+            );
+            if artifact.maintenance_mode == MaintenanceMode::WalletReset {
+                ensure!(
+                    artifact.known_utxo_sync_performed && artifact.revealed_script_sync_performed,
+                    "wallet-reset artifact was not built from an exhaustive revealed-script sync"
+                );
+                ensure!(
+                    artifact.require_drain_all,
+                    "wallet-reset artifact does not require a full drain"
+                );
+                ensure!(
+                    artifact.preserved_input_count == 0,
+                    "wallet-reset artifact preserves source-wallet UTXOs"
+                );
+                ensure!(
+                    keychain == KeychainKind::Internal,
+                    "wallet-reset artifact does not use the fresh wallet internal keychain"
+                );
+                ensure!(
+                    source_identity.descriptor_sha256 != destination_identity.descriptor_sha256,
+                    "wallet-reset artifact has identical source and destination descriptors"
+                );
+                let accounted_inputs = artifact
+                    .inputs
+                    .len()
+                    .checked_add(artifact.excluded_eligible_input_count)
+                    .context("wallet-reset input accounting overflow")?;
+                ensure!(
+                    accounted_inputs == artifact.eligible_input_count,
+                    "wallet-reset artifact omits or adds source-wallet inputs"
+                );
+            }
+        }
+        MaintenanceMode::Bridge => {
+            ensure!(
+                artifact.destination_descriptor_identity.is_none(),
+                "bridge artifact must not claim a destination descriptor identity"
+            );
+            ensure!(
+                artifact.destination_keychain == "bridge" && artifact.destination_index == 0,
+                "bridge artifact has invalid external-destination metadata"
+            );
+            ensure!(
+                artifact.bridge_control_verified,
+                "bridge artifact does not record the bridge-control acknowledgement"
+            );
+            ensure!(
+                artifact.known_utxo_sync_performed && artifact.revealed_script_sync_performed,
+                "bridge artifact was not built from an exhaustive revealed-script sync"
+            );
+            ensure!(
+                artifact.require_drain_all
+                    && artifact.preserved_input_count == 0
+                    && artifact.excluded_eligible_input_count == 0,
+                "bridge artifact is not an exact zero-reserve drain"
+            );
+            ensure!(
+                artifact.exclusion_count == 0
+                    && artifact.exclusion_sha256 == exclusion_digest(&HashSet::new()),
+                "bridge artifact does not contain the required empty exclusion manifest"
+            );
+            ensure!(
+                artifact.inputs.len() == artifact.eligible_input_count,
+                "bridge artifact omits or adds source-wallet inputs"
+            );
+            ensure!(
+                artifact.planned_output_count == 1 && artifact.outputs.len() == 1,
+                "bridge artifact must contain exactly one destination output"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn broadcast(args: BroadcastArgs) -> Result<()> {
     ensure!(
         args.confirm_safe_to_broadcast == BROADCAST_CONFIRMATION,
@@ -1122,7 +1820,7 @@ async fn broadcast(args: BroadcastArgs) -> Result<()> {
     );
     let artifact: MaintenanceArtifact = serde_json::from_slice(&fs::read(&args.artifact)?)?;
     ensure!(
-        artifact.version == ARTIFACT_VERSION,
+        (LEGACY_ARTIFACT_VERSION..=ARTIFACT_VERSION).contains(&artifact.version),
         "unsupported artifact version"
     );
     let artifact_txid = Txid::from_str(&artifact.txid)?;
@@ -1158,6 +1856,22 @@ async fn broadcast(args: BroadcastArgs) -> Result<()> {
         artifact.weight_wu <= MAX_STANDARD_WEIGHT_WU,
         "artifact exceeds Bitcoin's standardness weight limit"
     );
+    if artifact.version == ARTIFACT_VERSION {
+        let conservative_weight_wu = conservative_signed_p2wpkh_weight(&psbt.unsigned_tx);
+        ensure!(
+            artifact.conservative_weight_wu == conservative_weight_wu,
+            "artifact conservative weight estimate is inconsistent"
+        );
+        ensure!(
+            artifact.weight_wu <= conservative_weight_wu,
+            "signed artifact exceeds its conservative P2WPKH weight estimate"
+        );
+        ensure!(
+            conservative_weight_wu <= artifact.max_weight_wu
+                && conservative_weight_wu <= MAX_STANDARD_WEIGHT_WU,
+            "artifact conservative weight estimate exceeds a weight cap"
+        );
+    }
     let destination_script = ScriptBuf::from_hex(&artifact.destination_script_hex)?;
     let destination = Address::<NetworkUnchecked>::from_str(&artifact.destination)?
         .require_network(Network::Signet)?;
@@ -1165,6 +1879,7 @@ async fn broadcast(args: BroadcastArgs) -> Result<()> {
         destination.script_pubkey() == destination_script,
         "artifact destination address and script are inconsistent"
     );
+    validate_versioned_artifact(&artifact, &destination, &destination_script)?;
     ensure!(
         signed
             .output
@@ -1326,6 +2041,245 @@ mod tests {
     }
 
     #[test]
+    fn wallet_reset_requires_the_exact_non_excluded_set() {
+        let first = OutPoint::new(Txid::from_byte_array([1; 32]), 0);
+        let second = OutPoint::new(Txid::from_byte_array([2; 32]), 1);
+        let third = OutPoint::new(Txid::from_byte_array([3; 32]), 2);
+        let extra = OutPoint::new(Txid::from_byte_array([4; 32]), 3);
+        let eligible = [first, second, third];
+        let excluded = HashSet::from([second]);
+
+        assert_eq!(
+            verify_drain_all_outpoints(&eligible, &excluded, &[first, third]).unwrap(),
+            1
+        );
+        assert!(verify_drain_all_outpoints(&eligible, &excluded, &[first]).is_err());
+        assert!(verify_drain_all_outpoints(&eligible, &excluded, &[first, third, extra]).is_err());
+        assert!(verify_drain_all_outpoints(&eligible, &excluded, &[first, second, third]).is_err());
+    }
+
+    #[test]
+    fn fresh_bip84_destination_is_derived_from_the_supplied_identity() {
+        let account_xpub = Xpub::from_str(
+            "tpubDC2Qwo2TFsaNC4ju8nrUJ9mqVT3eSgdmy1yPqhgkjwmke3PRXutNGRYAUo6RCHTcVQaDR3ohNU9we59brGHuEKPvH1ags2nevW5opEE9Z5Q",
+        )
+        .unwrap();
+        let fingerprint = Fingerprint::from_str("c55b303f").unwrap();
+        let identity =
+            bip84_descriptor_identity(account_xpub, fingerprint, Network::Signet, true).unwrap();
+        let index = 7;
+        let derived =
+            derive_bip84_destination(&identity, KeychainKind::Internal, index, true).unwrap();
+
+        let secp = Secp256k1::verification_only();
+        let child = account_xpub
+            .derive_pub(
+                &secp,
+                &[
+                    ChildNumber::Normal { index: 1 },
+                    ChildNumber::Normal { index },
+                ],
+            )
+            .unwrap();
+        let expected = Address::p2wpkh(&child.to_pub(), Network::Signet);
+        assert_eq!(derived, expected);
+        assert_eq!(identity.network, "signet");
+        assert!(identity.internal_descriptor.contains("/1/*"));
+        assert_eq!(identity.descriptor_sha256.len(), 64);
+    }
+
+    #[test]
+    fn descriptor_identity_validation_fails_on_metadata_changes() {
+        let account_xpub = Xpub::from_str(
+            "tpubDC2Qwo2TFsaNC4ju8nrUJ9mqVT3eSgdmy1yPqhgkjwmke3PRXutNGRYAUo6RCHTcVQaDR3ohNU9we59brGHuEKPvH1ags2nevW5opEE9Z5Q",
+        )
+        .unwrap();
+        let fingerprint = Fingerprint::from_str("c55b303f").unwrap();
+        let mut identity =
+            bip84_descriptor_identity(account_xpub, fingerprint, Network::Signet, true).unwrap();
+        validate_descriptor_identity(&identity, true).unwrap();
+
+        identity.internal_descriptor.push('0');
+        assert!(validate_descriptor_identity(&identity, true).is_err());
+    }
+
+    fn unsigned_plan_fixture() -> UnsignedPlanReport {
+        let account_xpub = Xpub::from_str(
+            "tpubDC2Qwo2TFsaNC4ju8nrUJ9mqVT3eSgdmy1yPqhgkjwmke3PRXutNGRYAUo6RCHTcVQaDR3ohNU9we59brGHuEKPvH1ags2nevW5opEE9Z5Q",
+        )
+        .unwrap();
+        let identity = bip84_descriptor_identity(
+            account_xpub,
+            Fingerprint::from_str("c55b303f").unwrap(),
+            Network::Signet,
+            true,
+        )
+        .unwrap();
+        UnsignedPlanReport {
+            version: ARTIFACT_VERSION,
+            unsigned_txid: Txid::from_byte_array([9; 32]).to_string(),
+            snapshot_tip_height: 100,
+            remote_tip_height: 101,
+            known_utxo_sync_performed: true,
+            revealed_script_sync_performed: true,
+            bridge_control_verified: false,
+            maintenance_mode: MaintenanceMode::WalletReset,
+            source_descriptor_identity: identity.clone(),
+            destination_descriptor_identity: Some(identity.clone()),
+            require_drain_all: true,
+            eligible_input_count: 1,
+            excluded_eligible_input_count: 0,
+            preserved_input_count: 0,
+            planned_output_count: 1,
+            destination: "tb1qexample".to_string(),
+            destination_keychain: "internal".to_string(),
+            destination_index: 0,
+            xpub: identity.account_xpub.clone(),
+            master_fingerprint: identity.master_fingerprint.clone(),
+            signer_network: "mutinynet".to_string(),
+            exclusion_count: 0,
+            exclusion_sha256: sha256::Hash::hash(b"").to_string(),
+            inputs: vec![InputRecord {
+                outpoint: OutPoint::new(Txid::from_byte_array([8; 32]), 0).to_string(),
+                value_sats: 10_000,
+                script_pubkey_hex: "0014".to_string(),
+                confirmation_height: 90,
+            }],
+            outputs: vec![OutputRecord {
+                value_sats: 9_000,
+                script_pubkey_hex: "0014".to_string(),
+            }],
+            psbt: "approved-psbt".to_string(),
+            fee_sats: 1_000,
+            requested_fee_rate_sat_vb: 2,
+            conservative_weight_wu: 1_000,
+            max_fee_sats: 2_000,
+            max_weight_wu: 200_000,
+        }
+    }
+
+    #[test]
+    fn signing_commitment_ignores_only_moving_tip_observations() {
+        let approved = unsigned_plan_fixture();
+        let mut rebuilt = approved.clone();
+        rebuilt.snapshot_tip_height += 3;
+        rebuilt.remote_tip_height += 4;
+        assert_eq!(approved.signing_commitment(), rebuilt.signing_commitment());
+
+        let mut changed = rebuilt.clone();
+        changed.psbt.push('x');
+        assert_ne!(approved.signing_commitment(), changed.signing_commitment());
+
+        let mut changed = rebuilt.clone();
+        changed.inputs[0].value_sats += 1;
+        assert_ne!(approved.signing_commitment(), changed.signing_commitment());
+
+        let mut changed = rebuilt.clone();
+        changed.source_descriptor_identity.descriptor_sha256 = "0".repeat(64);
+        assert_ne!(approved.signing_commitment(), changed.signing_commitment());
+
+        let mut changed = rebuilt.clone();
+        changed.require_drain_all = false;
+        assert_ne!(approved.signing_commitment(), changed.signing_commitment());
+
+        let mut changed = rebuilt;
+        changed.maintenance_mode = MaintenanceMode::Bridge;
+        assert_ne!(approved.signing_commitment(), changed.signing_commitment());
+    }
+
+    fn bridge_artifact_fixture() -> (MaintenanceArtifact, Address, ScriptBuf) {
+        let source_xpub = Xpub::from_str(
+            "tpubDC2Qwo2TFsaNC4ju8nrUJ9mqVT3eSgdmy1yPqhgkjwmke3PRXutNGRYAUo6RCHTcVQaDR3ohNU9we59brGHuEKPvH1ags2nevW5opEE9Z5Q",
+        )
+        .unwrap();
+        let source_identity = bip84_descriptor_identity(
+            source_xpub,
+            Fingerprint::from_str("c55b303f").unwrap(),
+            Network::Signet,
+            false,
+        )
+        .unwrap();
+        let secp = Secp256k1::new();
+        let bridge_key = SecretKey::from_slice(&[99; 32]).unwrap();
+        let bridge_public_key = bdk_wallet::bitcoin::PublicKey::new(
+            bdk_wallet::bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &bridge_key),
+        );
+        let destination = Address::p2wpkh(&bridge_public_key.try_into().unwrap(), Network::Signet);
+        let destination_script = destination.script_pubkey();
+        let input = InputRecord {
+            outpoint: OutPoint::new(Txid::from_byte_array([5; 32]), 0).to_string(),
+            value_sats: 50_000,
+            script_pubkey_hex: "0014".to_string(),
+            confirmation_height: 100,
+        };
+        let output = OutputRecord {
+            value_sats: 49_000,
+            script_pubkey_hex: destination_script.as_bytes().to_lower_hex_string(),
+        };
+        let artifact = MaintenanceArtifact {
+            version: ARTIFACT_VERSION,
+            created_at_unix: 1,
+            snapshot_tip_height: 101,
+            snapshot_tip_hash: "00".repeat(32),
+            remote_tip_height: 102,
+            known_utxo_sync_performed: true,
+            revealed_script_sync_performed: true,
+            bridge_control_verified: true,
+            maintenance_mode: MaintenanceMode::Bridge,
+            source_descriptor_identity: Some(source_identity.clone()),
+            destination_descriptor_identity: None,
+            require_drain_all: true,
+            eligible_input_count: 1,
+            excluded_eligible_input_count: 0,
+            preserved_input_count: 0,
+            planned_output_count: 1,
+            xpub: source_identity.account_xpub,
+            master_fingerprint: source_identity.master_fingerprint,
+            signer_network: "mutinynet".to_string(),
+            destination: destination.to_string(),
+            destination_script_hex: destination_script.as_bytes().to_lower_hex_string(),
+            destination_keychain: "bridge".to_string(),
+            destination_index: 0,
+            exclusion_count: 0,
+            exclusion_sha256: exclusion_digest(&HashSet::new()),
+            inputs: vec![input],
+            outputs: vec![output],
+            psbt: String::new(),
+            signed_tx_hex: String::new(),
+            txid: Txid::from_byte_array([6; 32]).to_string(),
+            fee_sats: 1_000,
+            fee_rate_sat_vb: 1.0,
+            weight_wu: 500,
+            conservative_weight_wu: 600,
+            max_fee_sats: 2_000,
+            max_weight_wu: 1_000,
+        };
+        (artifact, destination, destination_script)
+    }
+
+    #[test]
+    fn bridge_artifact_requires_exact_full_drain_metadata() {
+        let (artifact, destination, destination_script) = bridge_artifact_fixture();
+        validate_versioned_artifact(&artifact, &destination, &destination_script).unwrap();
+
+        let mut changed = artifact.clone();
+        changed.bridge_control_verified = false;
+        assert!(validate_versioned_artifact(&changed, &destination, &destination_script).is_err());
+
+        let mut changed = artifact.clone();
+        changed.exclusion_count = 1;
+        assert!(validate_versioned_artifact(&changed, &destination, &destination_script).is_err());
+
+        let mut changed = artifact.clone();
+        changed.destination_descriptor_identity = changed.source_descriptor_identity.clone();
+        assert!(validate_versioned_artifact(&changed, &destination, &destination_script).is_err());
+
+        let mut changed = artifact;
+        changed.outputs.push(changed.outputs[0].clone());
+        assert!(validate_versioned_artifact(&changed, &destination, &destination_script).is_err());
+    }
+
+    #[test]
     fn artifact_write_is_create_only_and_private() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("batch.json");
@@ -1384,6 +2338,7 @@ mod tests {
     fn signed_transaction_requires_exact_psbt_and_valid_witness() {
         let (psbt, signed, prevouts) = signed_p2wpkh_fixture();
         verify_signed_transaction_with_prevouts(&psbt, &signed, prevouts.clone()).unwrap();
+        assert!(signed.weight().to_wu() <= conservative_signed_p2wpkh_weight(&psbt.unsigned_tx));
 
         let mut changed_output = signed.clone();
         changed_output.output[0].value = Amount::from_sat(48_999);
