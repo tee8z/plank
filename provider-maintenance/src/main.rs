@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, ensure, Context, Result};
 use base64::prelude::*;
+use bdk_core::spk_client::SyncRequest;
 use bdk_esplora::{esplora_client, EsploraAsyncExt};
 use bdk_sqlite::Store;
 use bdk_wallet::bitcoin::bip32::{Fingerprint, Xpub};
@@ -326,6 +327,22 @@ async fn sync_snapshot(
         .await
         .context("syncing revealed wallet scripts")?;
     wallet.apply_update(update)?;
+    wallet.persist_async(store).await?;
+
+    // Esplora snapshots its chain tip before scanning scripts. A large wallet can take
+    // many blocks to scan on Mutinynet, so refresh only the local chain after the
+    // expensive transaction update. Selected outpoints still receive a separate live
+    // outspend check immediately before signing.
+    let chain_update = client
+        .sync(
+            SyncRequest::<()>::builder()
+                .chain_tip(wallet.latest_checkpoint())
+                .build(),
+            1,
+        )
+        .await
+        .context("refreshing wallet chain tip after script sync")?;
+    wallet.apply_update(chain_update)?;
     wallet.persist_async(store).await?;
     Ok(wallet.latest_checkpoint().height())
 }

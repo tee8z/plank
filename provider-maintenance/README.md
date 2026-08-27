@@ -94,8 +94,9 @@ Run `inspect` before you sign a transaction:
 ```
 
 The JSON report includes the synchronized height, balance, eligible output count, batch count, and a known wallet destination.
-The scan snapshots the tip before it checks all revealed scripts.
-The tool permits at most 12 blocks of post-scan lag and uses live outspend checks before signing.
+The script scan snapshots the tip before it checks all revealed scripts.
+After that expensive scan, the tool performs a chain-only refresh and permits at most 12 blocks of lag.
+It also uses live outspend checks before signing.
 
 ## Prepare one batch
 
