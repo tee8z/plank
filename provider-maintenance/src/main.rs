@@ -96,6 +96,9 @@ struct PrepareArgs {
     /// Existing artifact directory. Inputs in prior artifacts are excluded automatically.
     #[arg(long)]
     artifact_dir: PathBuf,
+    /// Reuse a snapshot that completed `inspect`; refresh only its chain tip and live outspends.
+    #[arg(long)]
+    reuse_synced_snapshot: bool,
     /// Destination address. It must be a revealed address owned by this wallet snapshot.
     #[arg(long)]
     destination: Address<NetworkUnchecked>,
@@ -195,6 +198,7 @@ struct MaintenanceArtifact {
     snapshot_tip_height: u32,
     snapshot_tip_hash: String,
     remote_tip_height: u32,
+    script_sync_performed: bool,
     xpub: String,
     master_fingerprint: String,
     signer_network: String,
@@ -238,6 +242,7 @@ struct UnsignedPlanReport {
     unsigned_txid: String,
     snapshot_tip_height: u32,
     remote_tip_height: u32,
+    script_sync_performed: bool,
     destination: String,
     destination_keychain: String,
     destination_index: u32,
@@ -329,6 +334,14 @@ async fn sync_snapshot(
     wallet.apply_update(update)?;
     wallet.persist_async(store).await?;
 
+    refresh_snapshot_tip(wallet, store, client).await
+}
+
+async fn refresh_snapshot_tip(
+    wallet: &mut ProviderWallet,
+    store: &mut Store,
+    client: &esplora_client::AsyncClient,
+) -> Result<u32> {
     // Esplora snapshots its chain tip before scanning scripts. A large wallet can take
     // many blocks to scan on Mutinynet, so refresh only the local chain after the
     // expensive transaction update. Selected outpoints still receive a separate live
@@ -572,7 +585,11 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
 
     let (mut wallet, mut store) = open_wallet(&args.wallet).await?;
     let client = esplora_client(&args.wallet.esplora_url)?;
-    let snapshot_tip = sync_snapshot(&mut wallet, &mut store, &client).await?;
+    let snapshot_tip = if args.reuse_synced_snapshot {
+        refresh_snapshot_tip(&mut wallet, &mut store, &client).await?
+    } else {
+        sync_snapshot(&mut wallet, &mut store, &client).await?
+    };
     let remote_tip = client.get_height().await?;
     ensure!(
         remote_tip >= snapshot_tip,
@@ -707,6 +724,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         unsigned_txid: unsigned_txid.to_string(),
         snapshot_tip_height: snapshot_tip,
         remote_tip_height: remote_tip,
+        script_sync_performed: !args.reuse_synced_snapshot,
         destination: destination.to_string(),
         destination_keychain: match destination_keychain {
             KeychainKind::External => "external".to_owned(),
@@ -768,6 +786,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
             && approved_plan.xpub == plan.xpub
             && approved_plan.master_fingerprint == plan.master_fingerprint
             && approved_plan.signer_network == plan.signer_network
+            && approved_plan.script_sync_performed == plan.script_sync_performed
             && approved_plan.exclusion_count == plan.exclusion_count
             && approved_plan.exclusion_sha256 == plan.exclusion_sha256
             && approved_plan.inputs == plan.inputs
@@ -818,6 +837,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         snapshot_tip_height: snapshot_tip,
         snapshot_tip_hash: wallet.latest_checkpoint().hash().to_string(),
         remote_tip_height: remote_tip,
+        script_sync_performed: !args.reuse_synced_snapshot,
         xpub: args.wallet.xpub.to_string(),
         master_fingerprint: args.wallet.master_fingerprint.to_string(),
         signer_network: args.signer_network,

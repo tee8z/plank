@@ -53,6 +53,7 @@ The tool also enforces these properties:
 - Each selected input must be confirmed, P2WPKH, and unspent.
 - The two largest eligible outputs remain as a confirmed reserve by default.
 - A required exclusion manifest is recorded by count and SHA-256 digest.
+- A synchronized snapshot can use chain-only refreshes while fulfillment remains stopped.
 - A create-only unsigned plan must exist before the signer receives the PSBT.
 - Each transaction contains at most 500 inputs and 100 outputs by default.
 - The signer cannot change the inputs, outputs, sequences, version, or lock time.
@@ -113,6 +114,7 @@ First, create a durable unsigned plan without signer access:
   --esplora-url 'http://electrs-mutinynet.bitcoind:3000' \
   --exclude-outpoints /secure/prepared-payment-inputs.txt \
   --artifact-dir /secure/consolidation-artifacts \
+  --reuse-synced-snapshot \
   --destination '<OWNED_SIGNET_ADDRESS>' \
   --confirm-destination '<OWNED_SIGNET_ADDRESS>' \
   --dry-run \
@@ -139,6 +141,7 @@ Then sign the exact approved plan:
   --esplora-url 'http://electrs-mutinynet.bitcoind:3000' \
   --exclude-outpoints /secure/prepared-payment-inputs.txt \
   --artifact-dir /secure/consolidation-artifacts \
+  --reuse-synced-snapshot \
   --destination '<OWNED_SIGNET_ADDRESS>' \
   --confirm-destination '<OWNED_SIGNET_ADDRESS>' \
   --approved-plan /secure/plan-001.json \
@@ -158,6 +161,10 @@ Then sign the exact approved plan:
 ```
 
 Review the signed artifact. Verify its destination, output values, final fee, weight, and txid.
+
+`--reuse-synced-snapshot` is valid only after `inspect` completed against that exact snapshot.
+Keep fulfillment stopped for the whole sequence.
+The option skips the repeated 60,000-transaction script scan, refreshes the chain checkpoint, and still checks every selected outpoint live before signing.
 
 ## Broadcast one batch
 
