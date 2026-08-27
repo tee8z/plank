@@ -106,6 +106,11 @@ The application supports configuration via:
 
 ## Development
 
+### Provider wallet maintenance
+
+The repository includes a separate BDK provider maintenance command for bounded wallet consolidation.
+See [provider-maintenance/README.md](provider-maintenance/README.md) for its safety requirements and operator workflow.
+
 ### Key Components
 
 1. **Wallet Manager (bdk_wallet)**
