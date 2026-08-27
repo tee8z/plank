@@ -242,10 +242,20 @@ The tool derives the address again and requires an exact match.
 Wallet-reset mode rejects `--reuse-synced-snapshot`.
 Its exhaustive sync checks all persisted external and internal scripts.
 The sync does not rely on a small unused-address stop gap.
-The signing run repeats that scan and must reproduce the approved plan.
+If that exhaustive sync already completed and persisted on the exact offline snapshot, an operator can repeat the dry-run with `--reuse-exhaustively-synced-snapshot`.
+That narrowly scoped assertion refreshes the tip and live outspends without repeating the script scan, and it is committed into the plan digest.
+
+Plan construction asks BDK to enrich the complete selected input set once.
+It then copies those immutable PSBT input maps into bounded transactions in memory.
+It does not repeat SQLite-backed coin selection for each candidate batch.
+
+The signing run does not open, scan, or rebuild the historical wallet.
+It validates the sealed approved plan and every descriptor, destination, exclusion digest, output count, fee cap, weight cap, request cap, and mode flag against the repeated command.
+It then checks the complete input union live and signs the exact approved PSBTs.
 
 Create a new empty artifact directory for the reset.
-Create the unsigned plan:
+Create the unsigned plan.
+The example below reuses an exhaustive sync already persisted on this exact snapshot; omit `--reuse-exhaustively-synced-snapshot` for the first exhaustive run:
 
 ```bash
 "$task_plank_bin" prepare \
@@ -263,6 +273,7 @@ Create the unsigned plan:
   --confirm-fresh-wallet 'fresh-bip84-account-xpub-verified' \
   --confirm-destination '<INDEPENDENTLY_DERIVED_INTERNAL_ADDRESS>' \
   --require-drain-all \
+  --reuse-exhaustively-synced-snapshot \
   --min-confirmations 1 \
   --preserve-largest 0 \
   --max-inputs 1000 \
@@ -302,6 +313,7 @@ Then sign the unchanged plan:
   --confirm-fresh-wallet 'fresh-bip84-account-xpub-verified' \
   --confirm-destination '<INDEPENDENTLY_DERIVED_INTERNAL_ADDRESS>' \
   --require-drain-all \
+  --reuse-exhaustively-synced-snapshot \
   --min-confirmations 1 \
   --preserve-largest 0 \
   --max-inputs 1000 \

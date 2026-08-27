@@ -117,6 +117,9 @@ struct PrepareArgs {
     /// Reuse a snapshot that completed `inspect`; refresh only its chain tip and live outspends.
     #[arg(long)]
     reuse_synced_snapshot: bool,
+    /// Assert this exact snapshot already completed wallet-reset's exhaustive revealed-script sync.
+    #[arg(long)]
+    reuse_exhaustively_synced_snapshot: bool,
     /// Consolidate, reset to fresh BIP84 descriptors, or drain to a temporary bridge wallet.
     #[arg(long, value_enum, default_value_t)]
     mode: MaintenanceMode,
@@ -405,6 +408,7 @@ struct BatchSetPlan {
     remote_tip_height: u32,
     known_utxo_sync_performed: bool,
     revealed_script_sync_performed: bool,
+    exhaustive_sync_reused: bool,
     maintenance_mode: MaintenanceMode,
     source_descriptor_identity: DescriptorIdentity,
     destination_descriptor_identity: DescriptorIdentity,
@@ -1145,10 +1149,16 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         "max_outputs must be between 1 and 100"
     );
     match args.mode {
-        MaintenanceMode::Consolidate => ensure!(
-            args.target_output_sats >= 1_000,
-            "target output is unreasonably small"
-        ),
+        MaintenanceMode::Consolidate => {
+            ensure!(
+                args.target_output_sats >= 1_000,
+                "target output is unreasonably small"
+            );
+            ensure!(
+                !args.reuse_exhaustively_synced_snapshot,
+                "reuse_exhaustively_synced_snapshot is valid only in wallet-reset mode"
+            );
+        }
         MaintenanceMode::WalletReset | MaintenanceMode::Bridge => {
             let mode = match args.mode {
                 MaintenanceMode::WalletReset => "wallet-reset",
@@ -1192,6 +1202,10 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
                     args.max_outputs == 1,
                     "bridge mode requires explicit --max-outputs 1"
                 );
+                ensure!(
+                    !args.reuse_exhaustively_synced_snapshot,
+                    "bridge mode cannot reuse a wallet-reset exhaustive sync assertion"
+                );
             }
         }
     }
@@ -1221,6 +1235,10 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         );
     }
 
+    if args.mode == MaintenanceMode::WalletReset && !args.dry_run {
+        return sign_approved_wallet_reset_fast_path(&args).await;
+    }
+
     let (mut wallet, mut store) = open_wallet(&args.wallet).await?;
     let source_identity = bip84_descriptor_identity(
         args.wallet.xpub,
@@ -1237,6 +1255,9 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
     );
     let client = esplora_client(&args.wallet.esplora_url)?;
     let snapshot_tip = match args.mode {
+        MaintenanceMode::WalletReset if args.reuse_exhaustively_synced_snapshot => {
+            refresh_snapshot_tip(&mut wallet, &mut store, &client).await?
+        }
         MaintenanceMode::WalletReset | MaintenanceMode::Bridge => {
             sync_all_revealed_scripts(&mut wallet, &mut store, &client).await?
         }
@@ -1390,7 +1411,6 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         return prepare_wallet_reset_batch_set(
             &args,
             &mut wallet,
-            &client,
             snapshot_tip,
             remote_tip,
             source_identity,
@@ -1692,47 +1712,90 @@ fn build_reset_psbt_with_fixed_outputs(
     Ok(psbt)
 }
 
-fn build_reset_psbt(
-    wallet: &mut ProviderWallet,
+fn split_reset_psbt(
+    source_psbt: &Psbt,
     selected: &[LocalOutput],
     destination_script: &ScriptBuf,
     output_count: usize,
     fee_rate_sat_vb: u64,
 ) -> Result<Psbt> {
+    ensure!(!selected.is_empty(), "wallet-reset batch has no inputs");
+    ensure!(output_count > 0, "wallet-reset batch has no outputs");
+    ensure!(
+        source_psbt.unsigned_tx.input.len() == source_psbt.inputs.len(),
+        "source PSBT input maps are inconsistent"
+    );
+    let source_positions = source_psbt
+        .unsigned_tx
+        .input
+        .iter()
+        .enumerate()
+        .map(|(index, input)| (input.previous_output, index))
+        .collect::<HashMap<_, _>>();
+    ensure!(
+        source_positions.len() == source_psbt.inputs.len(),
+        "source PSBT contains duplicate outpoints"
+    );
+    let selected_positions = selected
+        .iter()
+        .map(|output| {
+            source_positions
+                .get(&output.outpoint)
+                .copied()
+                .with_context(|| format!("source PSBT omits selected outpoint {}", output.outpoint))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let unsigned_tx = Transaction {
+        version: source_psbt.unsigned_tx.version,
+        lock_time: source_psbt.unsigned_tx.lock_time,
+        input: selected_positions
+            .iter()
+            .map(|index| source_psbt.unsigned_tx.input[*index].clone())
+            .collect(),
+        output: (0..output_count)
+            .map(|_| TxOut {
+                value: Amount::from_sat(1_000),
+                script_pubkey: destination_script.clone(),
+            })
+            .collect(),
+    };
+    let mut psbt = Psbt::from_unsigned_tx(unsigned_tx)?;
+    psbt.version = source_psbt.version;
+    psbt.xpub = source_psbt.xpub.clone();
+    psbt.proprietary = source_psbt.proprietary.clone();
+    psbt.unknown = source_psbt.unknown.clone();
+    psbt.inputs = selected_positions
+        .iter()
+        .map(|index| source_psbt.inputs[*index].clone())
+        .collect();
+
     let selected_total = selected.iter().try_fold(0_u64, |sum, output| {
         sum.checked_add(output.txout.value.to_sat())
             .context("wallet-reset batch input value overflow")
     })?;
-    let provisional = build_reset_psbt_with_fixed_outputs(
-        wallet,
-        selected,
-        destination_script,
-        output_count,
-        1_000,
-        fee_rate_sat_vb,
-    )?;
-    let fee_sats = provisional.fee()?.to_sat();
+    let conservative_weight_wu = conservative_signed_p2wpkh_weight(&psbt.unsigned_tx);
+    let fee_sats = conservative_weight_wu
+        .div_ceil(4)
+        .checked_mul(fee_rate_sat_vb)
+        .context("wallet-reset batch fee overflow")?;
     let distributable = selected_total
         .checked_sub(fee_sats)
         .context("wallet-reset batch cannot pay its fee")?;
-    let fixed_output_sats = distributable
+    let output_value = distributable
         .checked_div(u64::try_from(output_count).context("invalid output count")?)
         .context("wallet-reset batch has zero outputs")?;
     ensure!(
-        fixed_output_sats >= 1_000,
+        output_value >= 1_000,
         "wallet-reset batch cannot fund {output_count} outputs of at least 1000 sats"
     );
-    let psbt = build_reset_psbt_with_fixed_outputs(
-        wallet,
-        selected,
-        destination_script,
-        output_count,
-        fixed_output_sats,
-        fee_rate_sat_vb,
-    )?;
+    for output in &mut psbt.unsigned_tx.output {
+        output.value = Amount::from_sat(output_value);
+    }
+    let remainder = distributable - output_value * u64::try_from(output_count)?;
+    psbt.unsigned_tx.output[0].value += Amount::from_sat(remainder);
     ensure!(
         psbt.fee()?.to_sat() == fee_sats,
-        "wallet-reset batch fee changed while distributing outputs"
+        "split wallet-reset PSBT fee is inconsistent"
     );
     Ok(psbt)
 }
@@ -1854,7 +1917,7 @@ fn distribute_reset_outputs_by_value(
 }
 
 fn build_reset_batches(
-    wallet: &mut ProviderWallet,
+    source_psbt: &Psbt,
     selected: &mut Vec<LocalOutput>,
     destination_script: &ScriptBuf,
     total_output_count: usize,
@@ -1862,8 +1925,8 @@ fn build_reset_batches(
 ) -> Result<Vec<BuiltResetBatch>> {
     let mut sized = Vec::with_capacity(selected.len());
     for output in selected.drain(..) {
-        let psbt = build_reset_psbt(
-            wallet,
+        let psbt = split_reset_psbt(
+            source_psbt,
             std::slice::from_ref(&output),
             destination_script,
             1,
@@ -1920,8 +1983,8 @@ fn build_reset_batches(
             let max_end = (start + args.max_inputs).min(input_count - batches_after);
             let mut best = None;
             for end in (start + 1)..=max_end {
-                let psbt = match build_reset_psbt(
-                    wallet,
+                let psbt = match split_reset_psbt(
+                    source_psbt,
                     &selected[start..end],
                     destination_script,
                     output_count,
@@ -1974,8 +2037,8 @@ fn build_reset_batches(
             let mut rebuilt = Vec::with_capacity(batches.len());
             let mut proportional_is_feasible = true;
             for (batch, output_count) in batches.into_iter().zip(proportional_counts) {
-                let psbt = match build_reset_psbt(
-                    wallet,
+                let psbt = match split_reset_psbt(
+                    source_psbt,
                     &selected[batch.input_range.clone()],
                     destination_script,
                     output_count,
@@ -2512,7 +2575,6 @@ fn input_records_prevouts(inputs: &[InputRecord]) -> Result<HashMap<OutPoint, Tx
 async fn prepare_wallet_reset_batch_set(
     args: &PrepareArgs,
     wallet: &mut ProviderWallet,
-    client: &esplora_client::AsyncClient,
     snapshot_tip: u32,
     remote_tip: u32,
     source_identity: DescriptorIdentity,
@@ -2539,8 +2601,19 @@ async fn prepare_wallet_reset_batch_set(
         eligible_outpoints.len() + excluded_eligible_input_count == eligible_input_count,
         "wallet-reset selected union does not account for every eligible outpoint"
     );
-    let built_batches = build_reset_batches(
+    // BDK performs its expensive SQLite-backed input enrichment exactly once. Every bounded
+    // batch below clones the resulting immutable PSBT input maps and constructs its unsigned
+    // transaction directly in memory.
+    let source_psbt = build_reset_psbt_with_fixed_outputs(
         wallet,
+        &selected,
+        &destination_script,
+        1,
+        1_000,
+        args.fee_rate_sat_vb,
+    )?;
+    let built_batches = build_reset_batches(
+        &source_psbt,
         &mut selected,
         &destination_script,
         reset_output_count,
@@ -2609,6 +2682,7 @@ async fn prepare_wallet_reset_batch_set(
         remote_tip_height: remote_tip,
         known_utxo_sync_performed: true,
         revealed_script_sync_performed: true,
+        exhaustive_sync_reused: args.reuse_exhaustively_synced_snapshot,
         maintenance_mode: MaintenanceMode::WalletReset,
         source_descriptor_identity: source_identity,
         destination_descriptor_identity: destination_identity,
@@ -2641,32 +2715,163 @@ async fn prepare_wallet_reset_batch_set(
     .seal()?;
     validate_batch_set_plan(&plan)?;
 
-    if args.dry_run {
-        let bytes = serde_json::to_vec_pretty(&plan)?;
-        write_create_only(
-            args.plan_output.as_deref().context("missing plan output")?,
-            &bytes,
-        )?;
-        println!("{}", String::from_utf8(bytes)?);
-        return Ok(());
-    }
-
-    let approved_path = args
-        .approved_plan
-        .as_deref()
-        .context("missing approved plan")?;
-    let approved: BatchSetPlan = serde_json::from_slice(&fs::read(approved_path)?)?;
-    validate_batch_set_plan(&approved)?;
     ensure!(
-        approved.signing_commitment() == plan.signing_commitment(),
-        "approved wallet-reset batch set does not match the exact rebuilt set"
+        args.dry_run,
+        "wallet-reset signing must use an approved version 4 plan"
     );
+    let bytes = serde_json::to_vec_pretty(&plan)?;
+    write_create_only(
+        args.plan_output.as_deref().context("missing plan output")?,
+        &bytes,
+    )?;
+    println!("{}", String::from_utf8(bytes)?);
+    Ok(())
+}
+
+fn validate_approved_batch_plan_against_args(
+    args: &PrepareArgs,
+    approved: &BatchSetPlan,
+    excluded: &HashSet<OutPoint>,
+) -> Result<()> {
+    validate_batch_set_plan(approved)?;
     ensure!(
         args.confirm_batch_plan_digest.as_deref() == Some(approved.plan_digest.as_str()),
         "confirmed batch-set digest does not match the approved plan"
     );
+    let source_identity = bip84_descriptor_identity(
+        args.wallet.xpub,
+        args.wallet.master_fingerprint,
+        Network::Signet,
+        false,
+    )?;
+    let destination_xpub = args
+        .new_wallet_xpub
+        .context("new_wallet_xpub is required for approved wallet-reset signing")?;
+    let destination_fingerprint = args
+        .new_wallet_master_fingerprint
+        .context("new_wallet_master_fingerprint is required for approved wallet-reset signing")?;
+    let destination_network = args
+        .new_wallet_network
+        .context("new_wallet_network is required for approved wallet-reset signing")?;
+    ensure!(
+        destination_network == Network::Signet,
+        "approved wallet-reset signing only supports Signet"
+    );
+    let destination_identity = bip84_descriptor_identity(
+        destination_xpub,
+        destination_fingerprint,
+        destination_network,
+        true,
+    )?;
+    let destination_index = args
+        .new_wallet_internal_index
+        .context("new_wallet_internal_index is required for approved wallet-reset signing")?;
+    let destination = derive_bip84_destination(
+        &destination_identity,
+        KeychainKind::Internal,
+        destination_index,
+        true,
+    )?;
+    let confirmed_destination = args
+        .confirm_destination
+        .clone()
+        .context("confirm_destination is required for approved wallet-reset signing")?
+        .require_network(Network::Signet)?;
+    ensure!(
+        args.destination.is_none()
+            && args.confirm_bridge_wallet.is_none()
+            && args.confirm_fresh_wallet.as_deref() == Some(FRESH_WALLET_CONFIRMATION)
+            && confirmed_destination == destination,
+        "fresh-wallet destination acknowledgements do not match the approved plan"
+    );
+    ensure!(
+        source_identity.descriptor_sha256 != destination_identity.descriptor_sha256,
+        "approved source and destination descriptors are identical"
+    );
+    ensure!(
+        approved.source_descriptor_identity == source_identity
+            && approved.destination_descriptor_identity == destination_identity
+            && approved.destination == destination.to_string()
+            && approved.destination_keychain == "internal"
+            && approved.destination_index == destination_index
+            && approved.xpub == args.wallet.xpub.to_string()
+            && approved.master_fingerprint == args.wallet.master_fingerprint.to_string(),
+        "approved plan descriptor or destination identity differs from the signing flags"
+    );
+    ensure!(
+        approved.maintenance_mode == args.mode
+            && approved.require_drain_all == args.require_drain_all
+            && approved.preserved_input_count == args.preserve_largest
+            && approved.planned_output_count
+                == args.reset_output_count.context("missing reset_output_count")?
+            && approved.requested_fee_rate_sat_vb == args.fee_rate_sat_vb
+            && approved.max_inputs_per_batch == args.max_inputs
+            && approved.max_outputs_per_batch == args.max_outputs
+            && approved.max_total_fee_sats == args.max_fee_sats
+            && approved.max_fee_sats_per_batch == args.max_fee_sats_per_batch
+            && approved.max_weight_wu_per_batch == args.max_weight_wu
+            && approved.max_signer_request_bytes == args.max_signer_request_bytes
+            && approved.signer_network == args.signer_network
+            && approved.exhaustive_sync_reused == args.reuse_exhaustively_synced_snapshot,
+        "approved plan mode, output count, signer network, or safety caps differ from the signing flags"
+    );
+    ensure!(
+        args.min_confirmations == 1
+            && args.preserve_largest == 0
+            && !args.reuse_synced_snapshot
+            && approved.known_utxo_sync_performed
+            && approved.revealed_script_sync_performed,
+        "approved wallet-reset signing flags do not preserve the exhaustive dry-run invariant"
+    );
+    ensure!(
+        approved.exclusion_count == excluded.len()
+            && approved.exclusion_sha256 == exclusion_digest(excluded),
+        "approved plan exclusion inventory differs from the signing manifest"
+    );
+    Ok(())
+}
 
-    let all_outpoints = plan
+async fn sign_approved_wallet_reset_fast_path(args: &PrepareArgs) -> Result<()> {
+    validate_snapshot_path(&args.wallet.wallet_db)?;
+    let approved_path = args
+        .approved_plan
+        .as_deref()
+        .context("missing approved version 4 wallet-reset plan")?;
+    let metadata = fs::symlink_metadata(approved_path).with_context(|| {
+        format!(
+            "reading approved plan metadata: {}",
+            approved_path.display()
+        )
+    })?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "approved plan must be a regular, non-symbolic-link file"
+    );
+    let approved: BatchSetPlan = serde_json::from_slice(&fs::read(approved_path)?)?;
+    let excluded = load_exclusions(&args.exclude_outpoints)?;
+    validate_approved_batch_plan_against_args(args, &approved, &excluded)?;
+
+    let client = esplora_client(&args.wallet.esplora_url)?;
+    let remote_tip = client.get_height().await?;
+    ensure!(
+        remote_tip >= approved.remote_tip_height,
+        "Esplora is behind the approved wallet-reset plan"
+    );
+    let snapshot_tip_hash = client
+        .get_block_hash(approved.snapshot_tip_height)
+        .await
+        .context("resolving the approved snapshot tip on the current best chain")?
+        .to_string();
+    sign_approved_batch_set(args, &client, &approved, snapshot_tip_hash).await
+}
+
+async fn sign_approved_batch_set(
+    args: &PrepareArgs,
+    client: &esplora_client::AsyncClient,
+    approved: &BatchSetPlan,
+    snapshot_tip_hash: String,
+) -> Result<()> {
+    let all_outpoints = approved
         .batches
         .iter()
         .flat_map(|batch| batch.inputs.iter())
@@ -2674,7 +2879,7 @@ async fn prepare_wallet_reset_batch_set(
         .collect::<Result<Vec<_>, _>>()?;
     check_unspent(client, &all_outpoints).await?;
     let (manifest_path, mut manifest) =
-        initialize_or_resume_batch_manifest(&args.artifact_dir, &approved)?;
+        initialize_or_resume_batch_manifest(&args.artifact_dir, approved)?;
     ensure!(
         manifest.status != BatchSetStatus::FullySigned
             || manifest.signed_artifacts.len() == approved.batches.len(),
@@ -2722,18 +2927,14 @@ async fn prepare_wallet_reset_batch_set(
                 return Err(error).with_context(|| format!("signing batch {}", batch.batch_index));
             }
         };
-        let artifact = artifact_for_signed_batch(
-            &approved,
-            batch,
-            &signed,
-            wallet.latest_checkpoint().hash().to_string(),
-        )?;
+        let artifact =
+            artifact_for_signed_batch(approved, batch, &signed, snapshot_tip_hash.clone())?;
         let artifact_file = batch_artifact_file(batch);
         let artifact_sha256 = maintenance_artifact_digest(&artifact)?;
         manifest.signed_artifacts.push(SignedBatchRecord {
             batch_index: batch.batch_index,
             txid: artifact.txid.clone(),
-            artifact_file: artifact_file.clone(),
+            artifact_file,
             artifact_sha256,
             materialized: false,
             artifact,
@@ -2759,7 +2960,6 @@ async fn prepare_wallet_reset_batch_set(
             && manifest.signed_artifacts.len() == approved.batches.len(),
         "wallet-reset batch-set signing stopped before every transaction had an artifact"
     );
-    // A complete live union check is the final gate before any artifact can be broadcast.
     check_unspent(client, &all_outpoints).await?;
     persist_batch_manifest(&manifest_path, &manifest, false)?;
     println!("{}", serde_json::to_string_pretty(&manifest)?);
@@ -4013,6 +4213,7 @@ mod tests {
             remote_tip_height: 1,
             known_utxo_sync_performed: true,
             revealed_script_sync_performed: true,
+            exhaustive_sync_reused: false,
             maintenance_mode: MaintenanceMode::WalletReset,
             source_descriptor_identity: identity.clone(),
             destination_descriptor_identity: identity,
@@ -4047,6 +4248,211 @@ mod tests {
         let mut tampered = plan.clone();
         tampered.max_signer_request_bytes -= 1;
         assert_ne!(tampered.computed_digest().unwrap(), plan.plan_digest);
+    }
+
+    fn valid_single_batch_plan_fixture() -> BatchSetPlan {
+        let source_xpub = Xpub::from_str(
+            "tpubDC2Qwo2TFsaNC4ju8nrUJ9mqVT3eSgdmy1yPqhgkjwmke3PRXutNGRYAUo6RCHTcVQaDR3ohNU9we59brGHuEKPvH1ags2nevW5opEE9Z5Q",
+        )
+        .unwrap();
+        let source_fingerprint = Fingerprint::from_str("c55b303f").unwrap();
+        let source_identity =
+            bip84_descriptor_identity(source_xpub, source_fingerprint, Network::Signet, false)
+                .unwrap();
+        let destination_xpub = Xpub::from_str(
+            "tpubDCM5mwmwFmTGQCe3cUPyDp3eMDsXTnwDGUk3LsNNPmVbi1r3K2K2zATxN9WbTcfuaBCJD6n1X2CUhG59ryhhmzfZYAkVyqqmy7izu3XeXVr",
+        )
+        .unwrap();
+        let destination_fingerprint = Fingerprint::from_str("8198cbc8").unwrap();
+        let destination_identity = bip84_descriptor_identity(
+            destination_xpub,
+            destination_fingerprint,
+            Network::Signet,
+            true,
+        )
+        .unwrap();
+        let destination =
+            derive_bip84_destination(&destination_identity, KeychainKind::Internal, 0, true)
+                .unwrap();
+        let secp = Secp256k1::new();
+        let source_key = SecretKey::from_slice(&[88; 32]).unwrap();
+        let source_public_key = bdk_wallet::bitcoin::PublicKey::new(
+            bdk_wallet::bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &source_key),
+        );
+        let source_script = ScriptBuf::new_p2wpkh(&source_public_key.wpubkey_hash().unwrap());
+        let parent = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(Txid::from_byte_array([87; 32]), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: source_script.clone(),
+            }],
+        };
+        let outpoint = OutPoint::new(parent.compute_txid(), 0);
+        let unsigned = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(49_000),
+                script_pubkey: destination.script_pubkey(),
+            }],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned).unwrap();
+        psbt.inputs[0].witness_utxo = Some(parent.output[0].clone());
+        psbt.inputs[0].non_witness_utxo = Some(parent);
+        let input = InputRecord {
+            outpoint: outpoint.to_string(),
+            value_sats: 50_000,
+            script_pubkey_hex: source_script.as_bytes().to_lower_hex_string(),
+            confirmation_height: 90,
+        };
+        let output = OutputRecord {
+            value_sats: 49_000,
+            script_pubkey_hex: destination.script_pubkey().as_bytes().to_lower_hex_string(),
+        };
+        let batch = UnsignedBatchPlan {
+            batch_index: 1,
+            unsigned_txid: psbt.unsigned_tx.compute_txid().to_string(),
+            input_total_sats: 50_000,
+            output_total_sats: 49_000,
+            fee_sats: 1_000,
+            planned_output_count: 1,
+            signer_request_bytes: signer_request_body(&psbt, "mutinynet").unwrap().len(),
+            conservative_weight_wu: conservative_signed_p2wpkh_weight(&psbt.unsigned_tx),
+            inputs: vec![input],
+            outputs: vec![output],
+            psbt: psbt.to_string(),
+        };
+        BatchSetPlan {
+            version: BATCH_SET_VERSION,
+            plan_digest: String::new(),
+            snapshot_tip_height: 100,
+            remote_tip_height: 100,
+            known_utxo_sync_performed: true,
+            revealed_script_sync_performed: true,
+            exhaustive_sync_reused: false,
+            maintenance_mode: MaintenanceMode::WalletReset,
+            source_descriptor_identity: source_identity,
+            destination_descriptor_identity: destination_identity,
+            require_drain_all: true,
+            eligible_input_count: 1,
+            excluded_eligible_input_count: 0,
+            preserved_input_count: 0,
+            planned_output_count: 1,
+            destination: destination.to_string(),
+            destination_keychain: "internal".to_owned(),
+            destination_index: 0,
+            xpub: source_xpub.to_string(),
+            master_fingerprint: source_fingerprint.to_string(),
+            signer_network: "mutinynet".to_owned(),
+            exclusion_count: 0,
+            exclusion_sha256: exclusion_digest(&HashSet::new()),
+            total_input_sats: 50_000,
+            total_output_sats: 49_000,
+            total_fee_sats: 1_000,
+            requested_fee_rate_sat_vb: 3,
+            max_inputs_per_batch: 100,
+            max_outputs_per_batch: 100,
+            max_total_fee_sats: 200_000,
+            max_fee_sats_per_batch: 200_000,
+            max_weight_wu_per_batch: 200_000,
+            max_signer_request_bytes: DEFAULT_MAX_SIGNER_REQUEST_BYTES,
+            unsigned_txids: vec![batch.unsigned_txid.clone()],
+            batches: vec![batch],
+        }
+        .seal()
+        .unwrap()
+    }
+
+    #[test]
+    fn approved_plan_fast_path_requires_every_committed_signing_flag() {
+        let plan = valid_single_batch_plan_fixture();
+        validate_batch_set_plan(&plan).unwrap();
+        let destination = plan.destination.clone();
+        let digest = plan.plan_digest.clone();
+        let cli = Cli::try_parse_from([
+            "plank-provider-maintenance",
+            "prepare",
+            "--wallet-db",
+            "/tmp/source.snapshot.db",
+            "--xpub",
+            "tpubDC2Qwo2TFsaNC4ju8nrUJ9mqVT3eSgdmy1yPqhgkjwmke3PRXutNGRYAUo6RCHTcVQaDR3ohNU9we59brGHuEKPvH1ags2nevW5opEE9Z5Q",
+            "--master-fingerprint",
+            "c55b303f",
+            "--exclude-outpoints",
+            "/tmp/excluded.txt",
+            "--artifact-dir",
+            "/tmp/artifacts",
+            "--mode",
+            "wallet-reset",
+            "--new-wallet-xpub",
+            "tpubDCM5mwmwFmTGQCe3cUPyDp3eMDsXTnwDGUk3LsNNPmVbi1r3K2K2zATxN9WbTcfuaBCJD6n1X2CUhG59ryhhmzfZYAkVyqqmy7izu3XeXVr",
+            "--new-wallet-master-fingerprint",
+            "8198cbc8",
+            "--new-wallet-network",
+            "signet",
+            "--new-wallet-internal-index",
+            "0",
+            "--confirm-fresh-wallet",
+            FRESH_WALLET_CONFIRMATION,
+            "--confirm-destination",
+            &destination,
+            "--require-drain-all",
+            "--min-confirmations",
+            "1",
+            "--preserve-largest",
+            "0",
+            "--max-inputs",
+            "100",
+            "--reset-output-count",
+            "1",
+            "--max-outputs",
+            "100",
+            "--fee-rate-sat-vb",
+            "3",
+            "--max-fee-sats",
+            "200000",
+            "--max-fee-sats-per-batch",
+            "200000",
+            "--max-weight-wu",
+            "200000",
+            "--max-signer-request-bytes",
+            "921600",
+            "--approved-plan",
+            "/tmp/approved.json",
+            "--confirm-batch-plan-digest",
+            &digest,
+            "--signer-url",
+            "http://signer.invalid/v1/sign",
+            "--signer-auth-key",
+            "/tmp/auth.pem",
+            "--confirm-maintenance",
+            PREPARE_CONFIRMATION,
+        ])
+        .unwrap();
+        let Command::Prepare(args) = cli.command else {
+            panic!("expected prepare command")
+        };
+        validate_approved_batch_plan_against_args(&args, &plan, &HashSet::new()).unwrap();
+
+        let mut changed = plan.clone();
+        changed.max_signer_request_bytes -= 1;
+        changed = changed.seal().unwrap();
+        assert!(
+            validate_approved_batch_plan_against_args(&args, &changed, &HashSet::new()).is_err()
+        );
     }
 
     fn signed_p2wpkh_fixture() -> (Psbt, Transaction, HashMap<OutPoint, TxOut>) {
