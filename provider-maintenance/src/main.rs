@@ -2348,8 +2348,8 @@ fn materialize_signed_record(artifact_dir: &Path, record: &mut SignedBatchRecord
     if path.exists() {
         let on_disk: MaintenanceArtifact = serde_json::from_slice(&fs::read(&path)?)?;
         ensure!(
-            on_disk == record.artifact,
-            "signed batch {} artifact file differs from the reserved manifest artifact",
+            maintenance_artifact_digest(&on_disk)? == record.artifact_sha256,
+            "signed batch {} artifact file digest differs from the reserved manifest artifact",
             record.batch_index
         );
     } else {
@@ -3462,7 +3462,7 @@ fn load_batch_manifest_for_artifact(
         .find(|record| record.batch_index == artifact_index)
         .context("artifact is not present in the fully-signed batch manifest")?;
     ensure!(
-        record.artifact == *artifact
+        maintenance_artifact_digest(artifact)? == record.artifact_sha256
             && artifact_path.file_name().and_then(|name| name.to_str())
                 == Some(record.artifact_file.as_str()),
         "artifact file does not match its exact global manifest record"
@@ -4177,7 +4177,8 @@ mod tests {
     #[test]
     fn partial_signed_record_resumes_without_resigning_and_rejects_tampering() {
         let dir = tempdir().unwrap();
-        let (artifact, _, _) = bridge_artifact_fixture();
+        let (mut artifact, _, _) = bridge_artifact_fixture();
+        artifact.fee_rate_sat_vb = 1_001.0 / 333.0;
         let mut record = SignedBatchRecord {
             batch_index: 1,
             txid: artifact.txid.clone(),
@@ -4188,6 +4189,13 @@ mod tests {
         };
         assert!(materialize_signed_record(dir.path(), &mut record).unwrap());
         assert!(record.materialized);
+        // File formatting and a serde round trip are not artifact identity. The canonical
+        // parsed artifact digest is the durable commitment used by resume and broadcast.
+        fs::write(
+            dir.path().join("batch-001.json"),
+            serde_json::to_vec(&record.artifact).unwrap(),
+        )
+        .unwrap();
         assert!(!materialize_signed_record(dir.path(), &mut record).unwrap());
 
         fs::write(dir.path().join("batch-001.json"), b"{}\n").unwrap();
