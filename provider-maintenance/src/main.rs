@@ -32,6 +32,7 @@ const ARTIFACT_VERSION: u32 = 1;
 const MAX_STANDARD_WEIGHT_WU: u64 = 400_000;
 const MAX_SIGNER_RESPONSE_BYTES: u64 = 1_048_576;
 const MAX_POST_SYNC_TIP_LAG: u32 = 12;
+const UTXO_SYNC_PARALLEL_REQUESTS: usize = 16;
 const PREPARE_CONFIRMATION: &str = "fulfillment-stopped,prepared-inputs-excluded,inputs-compliant";
 const BROADCAST_CONFIRMATION: &str = "exclusive-maintenance-window-active";
 
@@ -198,7 +199,7 @@ struct MaintenanceArtifact {
     snapshot_tip_height: u32,
     snapshot_tip_hash: String,
     remote_tip_height: u32,
-    script_sync_performed: bool,
+    known_utxo_sync_performed: bool,
     xpub: String,
     master_fingerprint: String,
     signer_network: String,
@@ -242,7 +243,7 @@ struct UnsignedPlanReport {
     unsigned_txid: String,
     snapshot_tip_height: u32,
     remote_tip_height: u32,
-    script_sync_performed: bool,
+    known_utxo_sync_performed: bool,
     destination: String,
     destination_keychain: String,
     destination_index: u32,
@@ -327,10 +328,24 @@ async fn sync_snapshot(
     store: &mut Store,
     client: &esplora_client::AsyncClient,
 ) -> Result<u32> {
+    let known_outpoints = wallet
+        .list_unspent()
+        .map(|output| output.outpoint)
+        .collect::<Vec<_>>();
+    ensure!(
+        !known_outpoints.is_empty(),
+        "wallet snapshot contains no known unspent outputs"
+    );
     let update = client
-        .sync(wallet.start_sync_with_revealed_spks(), 5)
+        .sync(
+            SyncRequest::<()>::builder()
+                .chain_tip(wallet.latest_checkpoint())
+                .outpoints(known_outpoints)
+                .build(),
+            UTXO_SYNC_PARALLEL_REQUESTS,
+        )
         .await
-        .context("syncing revealed wallet scripts")?;
+        .context("syncing every known wallet UTXO")?;
     wallet.apply_update(update)?;
     wallet.persist_async(store).await?;
 
@@ -342,10 +357,9 @@ async fn refresh_snapshot_tip(
     store: &mut Store,
     client: &esplora_client::AsyncClient,
 ) -> Result<u32> {
-    // Esplora snapshots its chain tip before scanning scripts. A large wallet can take
-    // many blocks to scan on Mutinynet, so refresh only the local chain after the
-    // expensive transaction update. Selected outpoints still receive a separate live
-    // outspend check immediately before signing.
+    // Esplora snapshots its chain tip before checking outpoints. Refresh only the local
+    // chain after that bounded transaction update. Selected outpoints still receive a
+    // separate live outspend check immediately before signing.
     let chain_update = client
         .sync(
             SyncRequest::<()>::builder()
@@ -724,7 +738,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         unsigned_txid: unsigned_txid.to_string(),
         snapshot_tip_height: snapshot_tip,
         remote_tip_height: remote_tip,
-        script_sync_performed: !args.reuse_synced_snapshot,
+        known_utxo_sync_performed: !args.reuse_synced_snapshot,
         destination: destination.to_string(),
         destination_keychain: match destination_keychain {
             KeychainKind::External => "external".to_owned(),
@@ -786,7 +800,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
             && approved_plan.xpub == plan.xpub
             && approved_plan.master_fingerprint == plan.master_fingerprint
             && approved_plan.signer_network == plan.signer_network
-            && approved_plan.script_sync_performed == plan.script_sync_performed
+            && approved_plan.known_utxo_sync_performed == plan.known_utxo_sync_performed
             && approved_plan.exclusion_count == plan.exclusion_count
             && approved_plan.exclusion_sha256 == plan.exclusion_sha256
             && approved_plan.inputs == plan.inputs
@@ -837,7 +851,7 @@ async fn prepare(args: PrepareArgs) -> Result<()> {
         snapshot_tip_height: snapshot_tip,
         snapshot_tip_hash: wallet.latest_checkpoint().hash().to_string(),
         remote_tip_height: remote_tip,
-        script_sync_performed: !args.reuse_synced_snapshot,
+        known_utxo_sync_performed: !args.reuse_synced_snapshot,
         xpub: args.wallet.xpub.to_string(),
         master_fingerprint: args.wallet.master_fingerprint.to_string(),
         signer_network: args.signer_network,

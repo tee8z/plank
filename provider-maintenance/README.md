@@ -12,8 +12,8 @@ sequenceDiagram
     participant Esplora
     participant Signer as Fulfillment signer
 
-    Operator->>Snapshot: inspect and synchronize
-    Snapshot->>Esplora: fetch wallet updates and tip
+    Operator->>Snapshot: inspect and refresh known UTXOs
+    Snapshot->>Esplora: fetch outspends, transactions, and tip
     Operator->>Snapshot: create durable unsigned plan
     Operator->>Snapshot: approve exact PSBT and txid
     Snapshot->>Esplora: verify each input is unspent
@@ -53,7 +53,8 @@ The tool also enforces these properties:
 - Each selected input must be confirmed, P2WPKH, and unspent.
 - The two largest eligible outputs remain as a confirmed reserve by default.
 - A required exclusion manifest is recorded by count and SHA-256 digest.
-- A synchronized snapshot can use chain-only refreshes while fulfillment remains stopped.
+- Every known wallet UTXO is refreshed during `inspect`.
+- A refreshed snapshot can use chain-only updates while fulfillment remains stopped.
 - A create-only unsigned plan must exist before the signer receives the PSBT.
 - Each transaction contains at most 500 inputs and 100 outputs by default.
 - The signer cannot change the inputs, outputs, sequences, version, or lock time.
@@ -95,8 +96,10 @@ Run `inspect` before you sign a transaction:
 ```
 
 The JSON report includes the synchronized height, balance, eligible output count, batch count, and a known wallet destination.
-The script scan snapshots the tip before it checks all revealed scripts.
-After that expensive scan, the tool performs a chain-only refresh and permits at most 12 blocks of lag.
+The bounded sync checks every UTXO already known to the snapshot.
+It can discover a spend of a known output without rescanning approximately 66,000 historical scripts.
+It intentionally does not discover a new or resurrected output, so omitted funds remain untouched.
+After the outpoint sync, the tool performs a chain-only refresh and permits at most 12 blocks of lag.
 It also uses live outspend checks before signing.
 
 ## Prepare one batch
@@ -164,7 +167,7 @@ Review the signed artifact. Verify its destination, output values, final fee, we
 
 `--reuse-synced-snapshot` is valid only after `inspect` completed against that exact snapshot.
 Keep fulfillment stopped for the whole sequence.
-The option skips the repeated 60,000-transaction script scan, refreshes the chain checkpoint, and still checks every selected outpoint live before signing.
+The option skips the repeated all-known-UTXO refresh, updates the chain checkpoint, and still checks every selected outpoint live before signing.
 
 ## Broadcast one batch
 
