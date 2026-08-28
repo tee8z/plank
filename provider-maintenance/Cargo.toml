@@ -1,0 +1,29 @@
+[package]
+name = "plank-provider-maintenance"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22.1"
+bdk_esplora = { version = "=0.22.1", features = ["async", "tokio"] }
+bdk_chain = "=0.23.2"
+bdk_core = "=0.6.2"
+bdk_sqlite = "=0.5.0"
+bdk_wallet = "=2.3.0"
+bitcoin = { version = "=0.32.8", features = ["bitcoinconsensus-std", "serde"] }
+clap = { version = "4.4", features = ["derive"] }
+ed25519-dalek = { version = "2.2.0", features = ["pem", "pkcs8"] }
+esplora-client = "=0.12.2"
+futures = "0.3"
+hex = "0.4"
+miniscript = "=12.3.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.45.0", features = ["fs", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile = "3.20"
