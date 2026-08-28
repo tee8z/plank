@@ -2321,6 +2321,15 @@ fn maintenance_artifact_digest(artifact: &MaintenanceArtifact) -> Result<String>
     Ok(sha256::Hash::hash(&serde_json::to_vec(&commitment)?).to_string())
 }
 
+fn normalize_signed_record_digest(record: &mut SignedBatchRecord) -> Result<bool> {
+    let stable_digest = maintenance_artifact_digest(&record.artifact)?;
+    if record.artifact_sha256 == stable_digest {
+        return Ok(false);
+    }
+    record.artifact_sha256 = stable_digest;
+    Ok(true)
+}
+
 fn persist_batch_manifest(path: &Path, manifest: &BatchSetManifest, create: bool) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(manifest)?;
     if create {
@@ -2390,11 +2399,9 @@ fn validate_signed_manifest_records(manifest: &mut BatchSetManifest) -> Result<b
             record.batch_index
         );
         validate_batch_artifact_against_plan(&record.artifact, &manifest.plan, batch)?;
-        let stable_digest = maintenance_artifact_digest(&record.artifact)?;
-        if record.artifact_sha256 != stable_digest {
+        if normalize_signed_record_digest(record)? {
             // Normalize an original f64-sensitive v4 commitment only after the exact plan
             // binding and signed transaction have both validated.
-            record.artifact_sha256 = stable_digest;
             normalized = true;
         }
     }
@@ -4183,6 +4190,14 @@ mod tests {
             materialized: false,
             artifact,
         };
+        record.artifact_sha256 =
+            sha256::Hash::hash(&serde_json::to_vec(&record.artifact).unwrap()).to_string();
+        assert_ne!(
+            record.artifact_sha256,
+            maintenance_artifact_digest(&record.artifact).unwrap()
+        );
+        assert!(normalize_signed_record_digest(&mut record).unwrap());
+        assert!(!normalize_signed_record_digest(&mut record).unwrap());
         assert!(materialize_signed_record(dir.path(), &mut record).unwrap());
         assert!(record.materialized);
         // File formatting and a serde round trip are not artifact identity. The canonical
